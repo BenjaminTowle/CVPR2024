@@ -105,7 +105,6 @@ class SamBaseline(Model):
         self.processor = processor
         self.seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
         self.multimask_output = multimask_output
-        self.mask2gradient = {i: 0 for i in range(3)}  # Count how often each mask receives gradient
 
     @property
     def mask_decoder(self):
@@ -438,7 +437,7 @@ class SLIP(Model):
         reshaped_input_sizes = reshaped_input_sizes.repeat_interleave(self.num_simulations, dim=0)
 
         # Find intersection between all masks along dim 2
-        pred_masks, idxs, pred_iou = self._clustering(new_pred_masks, pred_masks, labels=labels, return_idxs=True)#, iou_scores=new_pred_iou)
+        pred_masks, idxs, pred_iou = self._clustering(new_pred_masks, pred_masks, labels=labels, return_idxs=True)
         iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
 
         if self.do_reduce:

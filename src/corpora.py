@@ -284,7 +284,7 @@ class PathDataset(TorchDataset):
             prompt = None
         
         # prepare image and prompt for the model
-        inputs = self.processor(image, input_boxes=prompt, return_tensors="pt") #, do_resize=False, do_pad=False)
+        inputs = self.processor(image, input_boxes=prompt, return_tensors="pt")
 
         # remove batch dimension which the processor adds by default
         inputs = {k:v.squeeze(0) for k,v in inputs.items()}
