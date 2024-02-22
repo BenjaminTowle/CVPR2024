@@ -1,5 +1,6 @@
 import sys
 import os
+import gdown
 sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
 from datasets import set_caching_enabled    
@@ -17,6 +18,12 @@ from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
 from src.modeling import SamBaseline, SLIP, SamThetaForTraining
 from src.utils import set_seed
+
+if not os.path.exists("data"):
+    os.makedirs("data")
+if not os.path.exists("data/lidc.pickle"):
+    file_id = "1QAtsh6qUgopFx1LJs20gOO9v5NP6eBgI"
+    gdown.download(f"https://drive.google.com/uc?id={file_id}", "data/data_lidc.pickle", quiet=False)
 
 set_seed()
 logger = logging.get_logger()
@@ -185,6 +192,9 @@ def _main(args):
     train_indices, test_indices = indices[split:], indices[:split]
     dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, test_indices)}
 
+    # Downsample the training set to 1000 samples for debugging
+    dataset["train"] = Subset(dataset["train"], list(range(1000)))
+
     # Downsample the test set to 100 samples for debugging
     dataset["valid"] = Subset(dataset["valid"], list(range(100)))
 
@@ -233,9 +243,9 @@ def _main(args):
         weight_decay=0.01,
         logging_dir="./logs",
         logging_steps=10,
-        evaluation_strategy="steps",
+        evaluation_strategy="epoch",
         eval_steps=100,
-        save_strategy="steps",
+        save_strategy="epoch",
         save_total_limit=1,
         learning_rate=args.learning_rate,
     )
