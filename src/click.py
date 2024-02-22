@@ -66,6 +66,9 @@ class TrainingClickStrategy(ClickStrategy):
         fn_count = fn_mask.sum()
         fp_count = fp_mask.sum()
 
+        if fn_count == 0 and fp_count == 0:
+            return [[0, 0] for _ in range(num_samples)], [0 for _ in range(num_samples)]
+
         num_fn_samples = 0
         num_fp_samples = 0
         for _ in range(num_samples):
@@ -74,8 +77,10 @@ class TrainingClickStrategy(ClickStrategy):
             else:
                 num_fp_samples += 1
 
-        clicks.extend(self.get_click_random(fn_mask, fn_count.item(), num_fn_samples))
-        clicks.extend(self.get_click_random(fp_mask, fp_count.item(), num_fp_samples))
+        if num_fn_samples > 0:
+            clicks.extend(self.get_click_random(fn_mask, fn_count.item(), num_fn_samples))
+        if num_fp_samples > 0:
+            clicks.extend(self.get_click_random(fp_mask, fp_count.item(), num_fp_samples))
         labels.extend([1] * num_fn_samples)
         labels.extend([0] * num_fp_samples)
 
@@ -224,6 +229,9 @@ class SamplingClickStrategy(ClickStrategy):
         fp_mask = np.where(binary_input_mask.squeeze().cpu().numpy() == 0, 0.0, fp_mask)
         # Set fn_mask to 0.0 where binary_input_mask is 1
         fn_mask = np.where(binary_input_mask.squeeze().cpu().numpy() == 1, 0.0, fn_mask)
+
+        if binary_input_mask.sum() == 0:
+            return [[0, 0] for _ in range(num_samples)], [0 for _ in range(num_samples)]
 
         while len(clicks) < num_samples:
             H, W = input_mask.shape[-2:]

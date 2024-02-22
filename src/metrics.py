@@ -35,6 +35,11 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
     iou_pearson = pearsonr(all_iou_preds, all_iou_scores)[0]
     iou_spearman = spearmanr(all_iou_preds, all_iou_scores)[0]
 
+    results["mean_dice"] = [s if not np.isnan(s) else 0.0 for s in results["mean_dice"]]
+    results["mean_nsd"] = [s if not np.isnan(s) else 0.0 for s in results["mean_nsd"]]
+    results["self_dice"] = [s if not np.isnan(s) else 1.0 for s in results["self_dice"]]
+    results["self_nsd"] = [s if not np.isnan(s) else 1.0 for s in results["self_nsd"]]
+
     results["iou_pearson"] = [iou_pearson]
     results["iou_spearman"] = [iou_spearman]
     results["all_iou_scores"] = all_iou_scores
@@ -45,6 +50,11 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
             json.dump(results, f)
 
     results = {name: np.mean(result) for name, result in results.items()}
+    
+    # Check for nan values
+    for name, result in results.items():
+        if np.isnan(result):
+            results[name] = 0.0
     
     return results
 

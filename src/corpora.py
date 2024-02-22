@@ -36,6 +36,49 @@ class PreprocessingStrategy(ABC, RegistryMixin):
         pass
 
 
+@PreprocessingStrategy.register_subclass("lidc")
+class LidcPreprocessingStrategy(PreprocessingStrategy):
+
+    n_annotations = 4
+    dataset_path = "data/lidc"
+
+    def _create_dataset(
+        self, split="training"
+    ):
+
+        images = []
+        labels = []
+        for folder in os.listdir(os.path.join(self.dataset_path, split)):
+            for file in os.listdir(os.path.join(self.dataset_path, split, folder)):
+                if "label" in file:
+                    labels.append(os.path.join(self.dataset_path, split, folder, file))
+                    continue
+                
+                for _ in range(self.n_annotations):
+                    images.append(os.path.join(self.dataset_path, split, folder, file))
+        
+        dataset = Dataset.from_dict({"image": images, "label": labels})
+        return dataset
+
+    def preprocess(
+        self, 
+        processor: SamProcessor, 
+        valid_size: float = 0.1, 
+        test_size: float = 0.1, 
+        **kwargs
+    ):
+
+        dataset = DatasetDict({
+            "train": self._create_dataset("training"),
+            "valid": self._create_dataset("testing"),
+            "test": self._create_dataset("testing")
+        })
+
+        for key in dataset.keys():
+            dataset[key] = PathDataset(dataset[key], processor, self.dataset_path, use_bounding_box=False)
+        return dataset
+        
+
 
 @PreprocessingStrategy.register_subclass("busi")
 class BUSIPreprocessingStrategy(PreprocessingStrategy):
@@ -74,7 +117,7 @@ class BUSIPreprocessingStrategy(PreprocessingStrategy):
         
         dataset = Dataset.from_dict({"image": image, "label": label})
 
-        dataset_cls = PathDataset if not kd else DistillationPathDataset
+        dataset_cls = PathDataset if not kd else PathDataset
 
         if do_split:
             dataset = self.train_valid_test_split(dataset, valid_size, test_size)
@@ -181,7 +224,7 @@ class ISICPreprocessingStrategy(PreprocessingStrategy):
             "test": test_dataset
         })
 
-        dataset_cls = PathDataset if not kd else DistillationPathDataset
+        dataset_cls = PathDataset
 
         if do_split:
             for key in dataset.keys():
@@ -233,7 +276,7 @@ class TIFFileReader(FileReader):
 class DefaultFileReader(FileReader):
 
     def __call__(self, path: str):
-        image = np.array(Image.open(path).resize((256, 256)))
+        image = np.array(Image.open(path).convert("RGB").resize((256, 256)))
         return image
 
 

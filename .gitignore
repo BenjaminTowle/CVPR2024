@@ -1,4 +1,7 @@
 data/
 results/
 **/__pycache__/
-surface-distance-master/
+surface_distance/
+wandb/
+logs/
+```
