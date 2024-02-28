@@ -21,7 +21,7 @@ from src.utils import set_seed
 
 if not os.path.exists("data"):
     os.makedirs("data")
-if not os.path.exists("data/lidc.pickle"):
+if not os.path.exists("data/data_lidc.pickle"):
     file_id = "1QAtsh6qUgopFx1LJs20gOO9v5NP6eBgI"
     gdown.download(f"https://drive.google.com/uc?id={file_id}", "data/data_lidc.pickle", quiet=False)
 
@@ -29,6 +29,7 @@ set_seed()
 logger = logging.get_logger()
 logging.set_verbosity_info()
 set_caching_enabled(False)
+os.environ["WANDB_DISABLED"] = "true"
 
 @dataclass
 class ModelArguments:
@@ -48,7 +49,7 @@ class ModelArguments:
     )
 
     model_save_path: str = field(
-        default="data/lidc_slip",
+        default="data/lidc_unet",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -59,12 +60,12 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="slip",
-        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta"]}
+        default="unet",
+        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet"]}
     )
 
     learning_rate: float = field(
-        default=1e-5,
+        default=1e-3,
         metadata={"help": "Learning rate"}
     )
 
@@ -74,7 +75,7 @@ class ModelArguments:
     )
 
     use_bounding_box: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether to use bounding boxes"}
     )
 
@@ -115,9 +116,10 @@ class LIDC_IDRI(Dataset):
     labels = []
     series_uid = []
 
-    def __init__(self, dataset_location, processor, transform=None):
+    def __init__(self, dataset_location, processor=None, transform=None, use_bounding_box=True):
         self.transform = transform
         self.processor = processor
+        self.use_bounding_box = use_bounding_box
         max_bytes = 2**31 - 1
         data = {}
         for file in os.listdir(dataset_location):
@@ -157,16 +159,17 @@ class LIDC_IDRI(Dataset):
             image = self.transform(image)
 
         # prepare image and prompt for the model
-        image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
-        input_boxes = [[get_bounding_box(label)]]
-        inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
-
-        # remove batch dimension which the processor adds by default
-        inputs = {k:v.squeeze(0) for k,v in inputs.items()}
-        inputs["labels"] = torch.tensor(label).to(inputs["pixel_values"].device)
-        inputs["labels"] = torch.nn.functional.interpolate(inputs["labels"].unsqueeze(0).unsqueeze(0), size=(256, 256), mode="nearest").bool().squeeze()
-        inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
-        inputs["reshaped_input_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+        if self.processor is not None:
+            image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
+            input_boxes = [[get_bounding_box(label)]] if self.use_bounding_box else None
+            inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
+            # remove batch dimension which the processor adds by default
+            inputs = {k:v.squeeze(0) for k,v in inputs.items()}
+            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+            inputs["reshaped_input_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+            inputs["labels"] = torch.nn.functional.interpolate(torch.tensor(label).unsqueeze(0).unsqueeze(0), size=(256, 256), mode="nearest").bool().squeeze()
+        else:
+            inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
 
         return inputs
 
@@ -179,24 +182,7 @@ from torch.utils.data import Subset
 
 def _main(args):
     # Load dataset
-    processor = SamProcessor.from_pretrained(args.model_load_path)
-    #preprocessing = PreprocessingStrategy.create(args.dataset)()
-    #dataset = preprocessing.preprocess(
-        #processor, valid_size=constants.VALID_SIZE, 
-        #test_size=constants.TEST_SIZE, use_bounding_box=args.use_bounding_box
-    #)
-    dataset = LIDC_IDRI(dataset_location = 'data/', processor = processor)
-    dataset_size = len(dataset)
-    indices = list(range(dataset_size))
-    split = int(np.floor(0.1 * dataset_size))
-    train_indices, test_indices = indices[split:], indices[:split]
-    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, test_indices)}
-
-    # Downsample the training set to 1000 samples for debugging
-    dataset["train"] = Subset(dataset["train"], list(range(1000)))
-
-    # Downsample the test set to 100 samples for debugging
-    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+    processor = SamProcessor.from_pretrained(args.model_load_path) if args.model_type != "unet" else None
 
     # Load model
     if args.model_type == "slip":
@@ -222,8 +208,25 @@ def _main(args):
         )
         model.set_env(env)
 
+    elif args.model_type == "unet":
+        from src.modeling import UNet
+        model = UNet(input_channels=1, num_classes=1, num_filters=[32,64,128,192], initializers=None, apply_last_layer=True, padding=True)
+
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
+
+    dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+    split = int(np.floor(0.1 * dataset_size))
+    train_indices, test_indices = indices[split:], indices[:split]
+    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, test_indices)}
+
+    # Downsample the training set to 1000 samples for debugging
+    #dataset["train"] = Subset(dataset["train"], list(range(1000)))
+
+    # Downsample the test set to 100 samples for debugging
+    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
@@ -243,10 +246,10 @@ def _main(args):
         weight_decay=0.01,
         logging_dir="./logs",
         logging_steps=10,
-        evaluation_strategy="epoch",
-        eval_steps=100,
-        save_strategy="epoch",
-        save_total_limit=1,
+        evaluation_strategy="steps",
+        eval_steps=1000,
+        #save_strategy="epoch",
+        #save_total_limit=1,
         learning_rate=args.learning_rate,
     )
 

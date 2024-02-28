@@ -19,6 +19,9 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
     metrics["iou"] = Metric.create("iou")
     predictions = eval_pred.predictions[1]
 
+    # convert eval_pred.label_ids to bool
+    eval_pred.label_ids = eval_pred.label_ids.astype(bool)
+
     results = {
         name: metric.compute(
             predictions, eval_pred.label_ids
