@@ -5,6 +5,8 @@ sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
 from datasets import set_caching_enabled    
 from dataclasses import dataclass, field
+import torch.nn.functional as F
+from torch.utils.data import Subset
 from transformers import (
     HfArgumentParser, 
     SamProcessor,
@@ -12,11 +14,16 @@ from transformers import (
     TrainingArguments,
 )
 from transformers.utils import logging
+from datasets import Dataset
+import numpy as np
+import os
+import pickle
+import torch
 
 from src import constants
 from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
-from src.modeling import SamBaseline, SLIP, SamThetaForTraining
+from src.modeling import SamBaseline, SLIP, SamThetaForTraining, UNet
 from src.utils import set_seed
 
 if not os.path.exists("data"):
@@ -49,7 +56,7 @@ class ModelArguments:
     )
 
     model_save_path: str = field(
-        default="data/lidc_unet",
+        default="data/lidc_slip",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -60,12 +67,12 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="unet",
+        default="slip",
         metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet"]}
     )
 
     learning_rate: float = field(
-        default=1e-3,
+        default=1e-4,
         metadata={"help": "Learning rate"}
     )
 
@@ -79,17 +86,15 @@ class ModelArguments:
         metadata={"help": "Whether to use bounding boxes"}
     )
 
+    use_input_masks: bool = field(
+        default=False,
+        metadata={"help": "Whether to use bounding boxes"}
+    )
+
     num_simulations: int = field(
         default=10,
         metadata={"help": "Number of simulations for SLIP"}
     )
-
-from datasets import Dataset
-import numpy as np
-import os
-import pickle
-import random
-import torch
 
 
 def get_bounding_box(ground_truth_map, add_perturbation=False):
@@ -116,10 +121,30 @@ class LIDC_IDRI(Dataset):
     labels = []
     series_uid = []
 
-    def __init__(self, dataset_location, processor=None, transform=None, use_bounding_box=True):
+    def __init__(
+        self, 
+        dataset_location, 
+        processor=None, 
+        transform=None, 
+        use_bounding_box=True, 
+        use_input_masks=True,
+        multilabel=True
+    ):
         self.transform = transform
         self.processor = processor
         self.use_bounding_box = use_bounding_box
+        self.use_input_masks = use_input_masks
+        self.multilabel = multilabel
+
+        self.model = None
+        if use_input_masks:
+            from safetensors.torch import load_file
+            file_path = 'data/checkpoint-42500/model.safetensors'
+            loaded = load_file(file_path)
+            model = UNet()
+            model.load_state_dict(loaded)
+            self.model = model
+        
         max_bytes = 2**31 - 1
         data = {}
         for file in os.listdir(dataset_location):
@@ -152,33 +177,42 @@ class LIDC_IDRI(Dataset):
 
     def __getitem__(self, index):
         image = np.expand_dims(self.images[index], axis=0)
-
-        #Randomly select one of the four labels for this image
-        label = self.labels[index][random.randint(0,3)].astype(float)
+        label = np.stack(self.labels[index]).astype(float)
+        
         if self.transform is not None:
             image = self.transform(image)
 
-        # prepare image and prompt for the model
+        # Prepare image and prompt for the model
         if self.processor is not None:
             image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
-            input_boxes = [[get_bounding_box(label)]] if self.use_bounding_box else None
+            input_boxes = [[get_bounding_box(label[0])]] if self.use_bounding_box else None
             inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
             # remove batch dimension which the processor adds by default
             inputs = {k:v.squeeze(0) for k,v in inputs.items()}
             inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
-            inputs["reshaped_input_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
-            inputs["labels"] = torch.nn.functional.interpolate(torch.tensor(label).unsqueeze(0).unsqueeze(0), size=(256, 256), mode="nearest").bool().squeeze()
+            #inputs["reshaped_input_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+            
+            inputs["labels"] = F.interpolate(
+                torch.tensor(label).unsqueeze(0), 
+                size=(256, 256), 
+                mode="nearest"
+            ).bool().squeeze()
         else:
             inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
 
+        if self.use_input_masks:
+            unet_input = torch.from_numpy(image[..., 0]).view(1, 1, *image.shape[:2]).float()  
+            input_masks = self.model(unet_input).pred_masks.squeeze(1)
+            inputs["input_masks"] = F.interpolate(
+                input_masks, size=(256, 256), 
+                mode="bilinear", align_corners=False
+            ).squeeze(0)
+        
         return inputs
 
-    # Override to give PyTorch size of dataset
     def __len__(self):
         return len(self.images)
 
-
-from torch.utils.data import Subset
 
 def _main(args):
     # Load dataset
@@ -209,13 +243,12 @@ def _main(args):
         model.set_env(env)
 
     elif args.model_type == "unet":
-        from src.modeling import UNet
-        model = UNet(input_channels=1, num_classes=1, num_filters=[32,64,128,192], initializers=None, apply_last_layer=True, padding=True)
+        model = UNet()
 
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
 
-    dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
+    dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box, use_input_masks=args.use_input_masks)
     dataset_size = len(dataset)
     indices = list(range(dataset_size))
     split = int(np.floor(0.1 * dataset_size))
@@ -230,7 +263,7 @@ def _main(args):
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
-    # 74.2 77.2
+ 
     # Make sure we only compute gradients for mask decoder
     for name, param in model.named_parameters():
         if name.startswith("sam.vision_encoder") or name.startswith("sam.prompt_encoder"):
@@ -247,8 +280,8 @@ def _main(args):
         logging_dir="./logs",
         logging_steps=10,
         evaluation_strategy="steps",
-        eval_steps=1000,
-        #save_strategy="epoch",
+        eval_steps=100,
+        save_strategy="no",
         #save_total_limit=1,
         learning_rate=args.learning_rate,
     )
@@ -266,7 +299,10 @@ def _main(args):
     if args.model_type == "theta":
         model.env = None
 
-    model.save_pretrained(args.model_save_path)
+    if args.model_type == "unet":
+        torch.save(model.state_dict(), args.model_save_path)
+    else:
+        model.save_pretrained(args.model_save_path)
 
 
 def main():

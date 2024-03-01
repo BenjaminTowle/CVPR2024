@@ -50,16 +50,14 @@ class TrainingClickStrategy(ClickStrategy):
     def get_click(
         self, 
         input_mask: torch.Tensor, 
-        binary_input_mask: torch.Tensor,
         label: Optional[torch.Tensor] = None, 
         num_samples: int = 1,
         image_embeddings: Optional[torch.Tensor] = None,
         input_boxes: Optional[torch.Tensor] = None
     ):
-        binary_input_mask = (F.sigmoid(input_mask) > 0.5).float()
+        binary_input_mask = (input_mask > 0.0).float()
         
-        clicks = []
-        labels = []
+        clicks, labels = [], []
         
         fn_mask = torch.logical_and(binary_input_mask == 0, label == 1)
         fp_mask = torch.logical_and(binary_input_mask == 1, label == 0)
@@ -212,44 +210,31 @@ class SamplingClickStrategy(ClickStrategy):
     def get_click(
         self, 
         input_mask: torch.Tensor, 
-        binary_input_mask: torch.Tensor,
         label: Optional[torch.Tensor] = None, 
         num_samples: int = 1,
         image_embeddings: Optional[torch.Tensor] = None,
         input_boxes: Optional[torch.Tensor] = None
     ):
 
-        clicks = []
-        labels = []
-
-        fp_mask = 1.0 - F.sigmoid(input_mask / self.temperature).squeeze().cpu().numpy()
-        fn_mask = F.sigmoid(input_mask / self.temperature).squeeze().cpu().numpy()
+        binary_input_mask = (input_mask > 0.0).float()
+        
+        fp_mask = 1.0 - F.sigmoid(input_mask).squeeze().cpu().numpy()
+        fn_mask = F.sigmoid(input_mask).squeeze().cpu().numpy()
 
         # Set fp_mask to 0.0 where binary_input_mask is 0
         fp_mask = np.where(binary_input_mask.squeeze().cpu().numpy() == 0, 0.0, fp_mask)
         # Set fn_mask to 0.0 where binary_input_mask is 1
         fn_mask = np.where(binary_input_mask.squeeze().cpu().numpy() == 1, 0.0, fn_mask)
 
-        if binary_input_mask.sum() == 0:
-            return [[0, 0] for _ in range(num_samples)], [0 for _ in range(num_samples)]
+        error_mask = torch.tensor(fp_mask + fn_mask).to("cuda")
+        topk = torch.topk(error_mask.reshape(-1), num_samples, largest=True)
+        idxs = topk.indices.cpu().numpy()
 
-        while len(clicks) < num_samples:
-            H, W = input_mask.shape[-2:]
-            random_mask = np.random.random((H, W))
-            for h in range(H):
-                for w in range(W):
-                    if random_mask[h, w] < fp_mask[h, w]:
-                        clicks.append([w, h])
-                        labels.append(0)
-                    elif random_mask[h, w] < fn_mask[h, w]:
-                        clicks.append([w, h])
-                        labels.append(1)
+        binary_input_mask = binary_input_mask.squeeze().cpu().numpy()
+        _, W = binary_input_mask.shape[-2:]
 
-        if len(clicks) > num_samples:
-            idxs = np.random.choice(len(clicks), num_samples, replace=False)
-            clicks = [clicks[idx] for idx in idxs]
-            labels = [labels[idx] for idx in idxs]
-
-        assert len(clicks) == num_samples, "Number of clicks must be equal to num_samples"
+        clicks = [[idx % W, idx // W] for idx in idxs]
+        labels = 1.0 - binary_input_mask.reshape(-1)[idxs]
+        
         
         return clicks, labels

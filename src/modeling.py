@@ -2,6 +2,7 @@ import monai
 import numpy as np
 import torch
 import torch.nn.functional as F
+import random
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -158,7 +159,7 @@ class SLIP(Model):
         config, 
         processor, 
         num_simulations: int = 50, 
-        num_preds: int = 3,
+        num_preds: int = 4,
         tau=0.7,
         theta_tau=0.2, 
         threshold=0.25,
@@ -168,12 +169,14 @@ class SLIP(Model):
         scorer: str = "iou",
         use_posterior: bool = False,
         do_reduce: bool = False,
+        multiple_annotations: bool = True,
     ):
         super().__init__(config)
         self.sam = SamModel(config)
         self.seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
         self.processor = processor
         self.num_simulations = num_simulations
+        self.multiple_annotations = multiple_annotations
 
         self.num_preds = num_preds
         self.threshold = threshold
@@ -202,7 +205,7 @@ class SLIP(Model):
     def _get_clicks(
         self,
         pred_masks: torch.Tensor,
-        binary_input_masks: torch.Tensor,
+        #binary_input_masks: torch.Tensor,
         original_sizes: torch.Tensor,
         reshaped_input_sizes: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
@@ -211,17 +214,16 @@ class SLIP(Model):
         input_boxes: Optional[torch.Tensor] = None,
     ):
 
-        input_masks = self.processor.image_processor.post_process_masks(
-            pred_masks.cpu(), original_sizes.cpu(), 
-            reshaped_input_sizes.cpu(),
-            binarize=False,
-        )
-        input_masks = torch.stack(input_masks, dim=0).to(self.device)
+        #input_masks = self.processor.image_processor.post_process_masks(
+            #pred_masks.cpu(), original_sizes.cpu(), 
+            #reshaped_input_sizes.cpu(),
+            #binarize=False,
+        #)
+        #input_masks = torch.stack(input_masks, dim=0).to(self.device)
 
         input_points, input_labels = zip(*map(lambda i: self.click_strategy.get_click(
-            input_mask=input_masks[i],
-            binary_input_mask=binary_input_masks[i],
-            label=labels[i] if labels is not None else None,
+            input_mask=pred_masks[i],
+            label=labels[i, random.randint(0, 3)] if labels is not None else None,
             num_samples=num_samples,
             image_embeddings=image_embeddings[i] if image_embeddings is not None else None,
             input_boxes=input_boxes[i] if input_boxes is not None else None,
@@ -238,7 +240,6 @@ class SLIP(Model):
     def _forward_train(
         self,
         pred_masks: torch.Tensor,
-        iou_scores: torch.Tensor,
         image_embeddings: torch.Tensor, 
         input_boxes: torch.Tensor,
         original_sizes: torch.Tensor,
@@ -249,61 +250,29 @@ class SLIP(Model):
         old_strategy = self.click_strategy
         self.set_click_strategy("training")
         
-        input_points, input_labels, input_masks = map(lambda _: None, range(3))
-        """
-        loss = self.compute_loss(
-            pred_masks=pred_masks, 
-            labels=labels, 
-            loss_fn=self.seg_loss, 
-            return_dict=False
-        )
-        """
-        loss = nn.BCEWithLogitsLoss()(pred_masks.squeeze(), labels.float())
+        input_points, input_labels = None, None
 
-        input_masks = self.processor.image_processor.post_process_masks(
-            pred_masks.cpu(), original_sizes.cpu(), 
-            reshaped_input_sizes.cpu(),
-            binarize=False
-        )
-        input_masks = F.sigmoid(torch.stack(input_masks, dim=0))
-        binary_input_masks = (F.sigmoid(input_masks) > 0.5).float()
+        loss = self.compute_loss(pred_masks, labels) 
 
         input_points, input_labels = self._get_clicks(
             pred_masks=pred_masks,
-            binary_input_masks=binary_input_masks,
             original_sizes=original_sizes,
             reshaped_input_sizes=reshaped_input_sizes,
             labels=labels,
             num_samples=1,
         )
 
-        input_masks = self.processor.image_processor.post_process_masks(
-            pred_masks.cpu(), original_sizes.cpu(), 
-            reshaped_input_sizes.cpu(),
-            binarize=True,
-        )
-        input_masks = torch.stack(
-            input_masks, dim=0).float().squeeze(2).to(self.device)
-
         outputs = self.sam(
             image_embeddings=image_embeddings,
             input_boxes=input_boxes,
             input_points=input_points,
             input_labels=input_labels,
-            input_masks=input_masks,
+            input_masks=pred_masks.squeeze(2),
             multimask_output=False,
         )
         pred_masks = outputs.pred_masks
 
-        loss += nn.BCEWithLogitsLoss()(pred_masks.squeeze(), labels.float())
-
-        """
-        loss += self.compute_loss(
-            pred_masks=outputs.pred_masks, 
-            labels=labels, 
-            loss_fn=self.seg_loss, 
-            return_dict=False
-        )"""
+        loss += self.compute_loss(pred_masks, labels)
 
         self.set_click_strategy(old_strategy)
 
@@ -327,7 +296,7 @@ class SLIP(Model):
         iou_scores=None,
     ):
 
-        p_pred = (F.sigmoid(pred_masks) > 0.5).squeeze(1).cpu().numpy()
+        p_pred = (pred_masks > 0.0).squeeze(1).cpu().numpy()
         shape = (p_pred.shape[0], p_pred.shape[1], p_pred.shape[1])
         similarity_matrix = np.zeros(shape)
         for i in range(shape[0]):
@@ -363,17 +332,8 @@ class SLIP(Model):
         i=0
     ):
 
-        input_masks = self.processor.image_processor.post_process_masks(
-                pred_masks.cpu(), original_sizes.cpu(), 
-                reshaped_input_sizes.cpu(),
-                binarize=False
-            )
-        input_masks = torch.stack(input_masks, dim=0)
-        binary_input_masks = (F.sigmoid(input_masks) > 0.5).float()
-
         input_points, input_labels = self._get_clicks(
             pred_masks=pred_masks, 
-            binary_input_masks=binary_input_masks,
             original_sizes=original_sizes,
             reshaped_input_sizes=reshaped_input_sizes,
             num_samples=self.num_simulations if i == 0 else 1,
@@ -389,7 +349,7 @@ class SLIP(Model):
         if input_boxes is not None:
             input_boxes = input_boxes.repeat_interleave(CHUNK_SIZE, dim=0)
         
-        input_masks = (F.sigmoid(input_masks) > 0.5).repeat_interleave(CHUNK_SIZE, dim=0).float()
+        input_masks = (pred_masks > 0.0).repeat_interleave(CHUNK_SIZE, dim=0).float()
         all_pred_masks = []
         all_pred_iou = []
 
@@ -439,7 +399,7 @@ class SLIP(Model):
 
         assert new_pred_masks.size(2) == self.num_simulations
 
-        loss = self.compute_loss(new_pred_masks, labels, self.seg_loss)
+        loss = self.compute_loss(new_pred_masks, labels)
         original_sizes = original_sizes.repeat_interleave(self.num_simulations, dim=0)
         reshaped_input_sizes = reshaped_input_sizes.repeat_interleave(self.num_simulations, dim=0)
 
@@ -447,21 +407,36 @@ class SLIP(Model):
         pred_masks, idxs, pred_iou = self._clustering(new_pred_masks, pred_masks, labels=labels, return_idxs=True)
         iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
 
-        if self.do_reduce:
-            pred_masks = new_pred_masks.mean(dim=2, keepdim=True)
-            iou_scores = torch.tensor(pred_iou).unsqueeze(1).mean(dim=2, keepdim=True) - 0.08
-
         return SamMultimaskOutput(
             loss=loss,
             iou_scores=iou_scores,
             pred_masks=pred_masks,
         )
 
+    @staticmethod
+    def loss_fn(A, B):
+        return nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)
+        #return monai.losses.DiceLoss(sigmoid=True)(A, B)
+
+    def compute_loss(self, pred_masks, labels):
+        #loss_fn = nn.BCEWithLogitsLoss()
+        #loss_fn = monai.losses.DiceLoss(sigmoid=True)
+        labels = labels.float()
+        pred_masks = pred_masks[:, 0, 0, :, :]
+        if self.multiple_annotations:
+            loss = 0.0
+            for i in range(labels.shape[1]):
+                loss += self.loss_fn(pred_masks, labels[:, i])
+            return loss / labels.shape[1]
+        
+        return loss_fn(pred_masks, labels[:, 0])
+
     def forward(
         self, 
         pixel_values=None,
         image_embeddings=None,
         input_boxes=None,
+        input_masks=None,
         labels=None,
         original_sizes=None,
         reshaped_input_sizes=None,
@@ -472,32 +447,24 @@ class SLIP(Model):
 
         outputs = self.sam(
             image_embeddings=image_embeddings, 
-            input_boxes=input_boxes, 
+            input_boxes=input_boxes,
+            input_masks=input_masks, 
             multimask_output=False
         )
+
+        kwargs = {
+            "pred_masks": outputs.pred_masks,
+            "image_embeddings": image_embeddings,
+            "input_boxes": input_boxes,
+            "original_sizes": original_sizes,
+            "reshaped_input_sizes": reshaped_input_sizes,
+            "labels": labels,
+        }
         
         if self.training:
-            outputs = self._forward_train(
-                pred_masks=outputs.pred_masks,
-                iou_scores=outputs.iou_scores,
-                image_embeddings=image_embeddings,
-                input_boxes=input_boxes,
-                original_sizes=original_sizes,
-                reshaped_input_sizes=reshaped_input_sizes,
-                labels=labels,
-            )
+            return self._forward_train(**kwargs)
 
-        else:
-            outputs = self._forward_eval(
-                pred_masks=outputs.pred_masks,
-                image_embeddings=image_embeddings,
-                input_boxes=input_boxes,
-                original_sizes=original_sizes,
-                reshaped_input_sizes=reshaped_input_sizes,
-                labels=labels,
-            )
-
-        return outputs
+        return self._forward_eval(**kwargs)
 
 
 class SamThetaForTraining(Model):
@@ -562,144 +529,6 @@ class SamThetaForTraining(Model):
             pred_masks=outputs.pred_masks,
         )
 
-"""
-
-class DoubleConv(nn.Module):
-
-    def __init__(self, in_channels, out_channels, mid_channels=None):
-        super().__init__()
-        if not mid_channels:
-            mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.double_conv(x)
-
-
-class Down(nn.Module):
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels)
-        )
-
-    def forward(self, x):
-        return self.maxpool_conv(x)
-
-
-class Up(nn.Module):
-
-    def __init__(self, in_channels, out_channels, bilinear=True):
-        super().__init__()
-
-        # if bilinear, use the normal convolutions to reduce the number of channels
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
-        else:
-            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels)
-
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        # input is CHW
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
-        # if you have padding issues, see
-        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
-        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-
-class OutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(OutConv, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class UNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=1, bilinear=False):
-        super(UNet, self).__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.bilinear = bilinear
-
-        self.inc = (DoubleConv(n_channels, 64))
-        self.down1 = (Down(64, 128))
-        self.down2 = (Down(128, 256))
-        self.down3 = (Down(256, 512))
-        factor = 2 if bilinear else 1
-        self.down4 = (Down(512, 1024 // factor))
-        self.up1 = (Up(1024, 512 // factor, bilinear))
-        self.up2 = (Up(512, 256 // factor, bilinear))
-        self.up3 = (Up(256, 128 // factor, bilinear))
-        self.up4 = (Up(128, 64, bilinear))
-        self.outc = (OutConv(64, n_classes))
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    def num_parameters(self):
-        return sum(p.numel() for p in self.parameters())
-
-    @classmethod
-    def from_pretrained(cls, model_path: str, device: str = "cuda"):
-        model = cls()
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        return model
-    
-    @classmethod
-    def save_pretrained(cls, model, model_path: str):
-        torch.save(model.state_dict(), model_path)
-
-    def forward(
-        self, 
-        pixel_values: torch.Tensor, 
-        labels: torch.Tensor = None, 
-        soft_targets: torch.Tensor = None,
-        **kwargs
-    ):
-        pixel_values = F.interpolate(pixel_values, size=(256, 256), mode="bilinear", align_corners=False)
-        
-        x1 = self.inc(pixel_values)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-
-        # Sanity check
-        labels = torch.ones_like(labels).to(labels.device)
-
-        # Dummy iou_scores required for evaluation code
-        iou_scores = torch.zeros(logits.shape[0], dtype=torch.float32, device=logits.device).unsqueeze(1).unsqueeze(1)
-        loss = monai.losses.DiceLoss(sigmoid=True)(logits.squeeze(1), labels)
-        
-        return SamMultimaskOutput(loss=loss, iou_scores=iou_scores, pred_masks=logits.unsqueeze(2))
-"""
-
-
 
 def truncated_normal_(tensor, mean=0, std=1):
     size = tensor.shape
@@ -712,8 +541,6 @@ def truncated_normal_(tensor, mean=0, std=1):
 def init_weights(m):
     if type(m) == nn.Conv2d or type(m) == nn.ConvTranspose2d:
         nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-        #nn.init.normal_(m.weight, std=0.001)
-        #nn.init.normal_(m.bias, std=0.001)
         truncated_normal_(m.bias, mean=0, std=0.001)
 
 class DownConvBlock(nn.Module):
@@ -781,7 +608,7 @@ class UNet(nn.Module):
     padidng: Boolean, if true we pad the images with 1 so that we keep the same dimensions
     """
 
-    def __init__(self, input_channels, num_classes, num_filters, initializers, apply_last_layer=True, padding=True):
+    def __init__(self, input_channels=1, num_classes=1, num_filters=[32,64,128,192], initializers=None, apply_last_layer=True, padding=True):
         super(UNet, self).__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -833,7 +660,6 @@ class UNet(nn.Module):
 
     def forward(self, pixel_values, labels=None):
         x = pixel_values
-        #x = F.interpolate(x, size=(256, 256), mode="bilinear", align_corners=False)
         blocks = []
         for i, down in enumerate(self.contracting_path):
             x = down(x)
@@ -845,7 +671,7 @@ class UNet(nn.Module):
 
         del blocks
 
-        #Used for saving the activations and plotting
+        # Used for saving the activations and plotting
         if not self.training:
             self.activation_maps.append(x)
         
@@ -855,9 +681,8 @@ class UNet(nn.Module):
         logits = x
         # Dummy iou_scores required for evaluation code
         iou_scores = torch.zeros(logits.shape[0], dtype=torch.float32, device=logits.device).unsqueeze(1).unsqueeze(1)
-        #loss = monai.losses.DiceLoss()(logits.squeeze(1), labels)
-        loss = nn.BCEWithLogitsLoss()(logits.squeeze(1), labels)
+        loss = None
+        if labels is not None:
+            loss = nn.BCEWithLogitsLoss()(logits.squeeze(1), labels)
         
         return SamMultimaskOutput(loss=loss, iou_scores=iou_scores, pred_masks=logits.unsqueeze(1))
-
-        #return x
