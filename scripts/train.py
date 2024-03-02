@@ -23,7 +23,7 @@ import torch
 from src import constants
 from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
-from src.modeling import SamBaseline, SLIP, SamThetaForTraining, UNet
+from src.modeling import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam
 from src.utils import set_seed
 
 if not os.path.exists("data"):
@@ -41,7 +41,7 @@ os.environ["WANDB_DISABLED"] = "true"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="facebook/sam-vit-base",
+        default="wanglab/medsam-vit-base",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -67,8 +67,8 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="slip",
-        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet"]}
+        default="stochastic",
+        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic"]}
     )
 
     learning_rate: float = field(
@@ -241,6 +241,13 @@ def _main(args):
             processor
         )
         model.set_env(env)
+
+    elif args.model_type == "stochastic":
+        model = StochasticSam.from_pretrained(
+            args.model_load_path,
+            processor=processor,
+            multimask_output=True
+        )
 
     elif args.model_type == "unet":
         model = UNet()

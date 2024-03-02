@@ -149,6 +149,172 @@ class SamBaseline(Model):
         )
 
 
+
+from torch.distributions.multivariate_normal import MultivariateNormal
+from typing import Tuple
+
+def forward(
+        self,
+        image_embeddings: torch.Tensor,
+        image_positional_embeddings: torch.Tensor,
+        sparse_prompt_embeddings: torch.Tensor,
+        dense_prompt_embeddings: torch.Tensor,
+        multimask_output: bool,
+        output_attentions: Optional[bool] = None,
+        attention_similarity: torch.Tensor = None,
+        target_embedding: torch.Tensor = None,
+        sampled_tokens: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict masks given image and prompt embeddings.
+
+        Args:
+            image_embeddings (`torch.Tensor`):
+                the embeddings from the image encoder
+            image_positional_embedding (`torch.Tensor`):
+                positional encoding with the shape of image_embeddings
+            sparse_prompt_embeddings (`torch.Tensor`):
+                The embeddings of the points and boxes
+            dense_prompt_embeddings (`torch.Tensor`):
+                the embeddings of the mask inputs
+            multimask_output (bool):
+                Whether to return multiple masks or a single mask.
+            output_attentions (bool, *optional*):
+                Whether or not to return the attentions tensors of all attention layers.
+        """
+        batch_size, num_channels, height, width = image_embeddings.shape
+        point_batch_size = sparse_prompt_embeddings.shape[1]
+        # Concatenate output tokens
+        output_tokens = torch.cat([self.iou_token.weight, sampled_tokens], dim=0)
+        
+        output_tokens = output_tokens.repeat(batch_size, point_batch_size, 1, 1)
+
+        if sparse_prompt_embeddings.sum().item() != 0:
+            tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=2)
+        else:
+            tokens = output_tokens
+        point_embeddings = tokens.to(self.iou_token.weight.dtype)
+
+        # Expand per-image data in batch direction to be per-point
+        image_embeddings = image_embeddings + dense_prompt_embeddings
+        image_embeddings = image_embeddings.repeat_interleave(point_batch_size, 0)
+        image_positional_embeddings = image_positional_embeddings.repeat_interleave(point_batch_size, 0)
+
+        # Run the transformer, image_positional_embedding are consumed
+        point_embedding, image_embeddings, attentions = self.transformer(
+            point_embeddings=point_embeddings,
+            image_embeddings=image_embeddings,
+            image_positional_embeddings=image_positional_embeddings,
+            attention_similarity=attention_similarity,
+            target_embedding=target_embedding,
+            output_attentions=output_attentions,
+        )
+        iou_token_out = point_embedding[:, :, 0, :]
+        mask_tokens_out = point_embedding[:, :, 1 : (1 + self.num_mask_tokens), :]
+
+        # Upscale mask embeddings and predict masks using the mask tokens
+        image_embeddings = image_embeddings.transpose(2, 3).reshape(
+            batch_size * point_batch_size, num_channels, height, width
+        )
+
+        upscaled_embedding = self.upscale_conv1(image_embeddings)
+        upscaled_embedding = self.activation(self.upscale_layer_norm(upscaled_embedding))
+        upscaled_embedding = self.activation(self.upscale_conv2(upscaled_embedding))
+
+        hyper_in_list = []
+        for i in range(self.num_mask_tokens):
+            current_mlp = self.output_hypernetworks_mlps[0]
+            hyper_in_list += [current_mlp(mask_tokens_out[:, :, i, :])]
+        hyper_in = torch.stack(hyper_in_list, dim=2)
+
+        _, num_channels, height, width = upscaled_embedding.shape
+        upscaled_embedding = upscaled_embedding.reshape(batch_size, point_batch_size, num_channels, height * width)
+        masks = (hyper_in @ upscaled_embedding).reshape(batch_size, point_batch_size, -1, height, width)
+
+        # Generate mask quality predictions
+        iou_pred = self.iou_prediction_head(iou_token_out)
+
+        # Select the correct mask or masks for output
+        if multimask_output:
+            mask_slice = slice(1, None)
+        else:
+            mask_slice = slice(0, 1)
+        masks = masks[:, :, mask_slice, :, :]
+        iou_pred = iou_pred[:, :, mask_slice]
+
+        outputs = (masks, iou_pred)
+
+        if output_attentions:
+            outputs = outputs + (attentions,)
+        else:
+            outputs = outputs + (None,)
+
+        return outputs
+
+
+from functools import partial
+
+class StochasticSam(Model):
+
+    def __init__(
+        self,
+        config, 
+        **kwargs
+    ):
+
+        super().__init__(config)
+        self.sam = SamModel(config)
+
+        # Create mean and covariance weights
+        self.mean_weights = nn.Parameter(nn.init.uniform_(torch.zeros(256), a=-0.02, b=0.02))
+        self.cov_weights = nn.Parameter(nn.init.uniform_(torch.zeros(256, 256), a=-0.02, b=0.02))
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        input_boxes: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        original_sizes: Optional[torch.Tensor] = None,
+        reshaped_input_sizes: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+
+        if image_embeddings is None:
+            image_embeddings = self.sam.get_image_embeddings(pixel_values)
+
+        # Sample from multivariate normal distribution
+        Sigma_k = torch.mm(self.cov_weights, self.cov_weights.T)
+        Sigma_k.add_(torch.eye(256).to(Sigma_k.device))
+        
+        dist = MultivariateNormal(self.mean_weights, Sigma_k)
+        sampled_tokens = dist.rsample([5])
+        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=sampled_tokens)
+        self.sam.mask_decoder.num_mask_tokens = 5
+
+        outputs = self.sam(
+            image_embeddings=image_embeddings,
+            input_boxes=input_boxes,
+            multimask_output=True,
+        )
+
+        loss = 0.0
+        labels = labels.float()
+        for i in range(outputs.pred_masks.shape[2]):
+            for j in range(labels.shape[1]):
+                A = outputs.pred_masks[:, 0, i, :, :]
+                B = labels[:, j]
+                loss += nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)
+        loss /= outputs.pred_masks.shape[2] * labels.shape[1]
+
+        return SamMultimaskOutput(
+            loss=loss,
+            pred_masks=outputs.pred_masks,
+            # Dummy iou_scores required for evaluation code
+            iou_scores=torch.zeros(outputs.pred_masks.shape[0], dtype=torch.float32, device=outputs.pred_masks.device).unsqueeze(1).unsqueeze(1)
+        )
+
+
 class SLIP(Model):
 
     """
@@ -429,7 +595,7 @@ class SLIP(Model):
                 loss += self.loss_fn(pred_masks, labels[:, i])
             return loss / labels.shape[1]
         
-        return loss_fn(pred_masks, labels[:, 0])
+        return self.loss_fn(pred_masks, labels[:, 0])
 
     def forward(
         self, 

@@ -4,4 +4,5 @@ results/
 surface_distance/
 wandb/
 logs/
+.vscode/
 ```

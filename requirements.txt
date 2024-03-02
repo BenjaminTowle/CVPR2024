@@ -1,5 +1,6 @@
 accelerate
 datasets
+medpy
 monai
 numpy
 opencv-python
