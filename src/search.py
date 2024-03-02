@@ -149,7 +149,7 @@ class State:
 
         D = self.scores[self.chosen_idxs][:, self.chosen_idxs]
         for i in range(len(D)):
-            D[i, i] = 0.0
+            D[i, i] = 1.0
 
         return - np.mean(np.max(D, axis=0), axis=-1).item()
          

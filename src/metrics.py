@@ -21,6 +21,22 @@ def compute_dice(predictions, labels):
 
     return results
 
+def compute_dice_max(predictions, labels):
+    results = []
+    for pred, label in zip(predictions, labels):
+        pred = np.round(np.mean((pred > 0.0).astype(np.float32), axis=0)).astype(np.int64)
+        label = label.astype(np.int64)
+        #results.append(
+            #np.mean([np.mean([dice(target == i, pred == i) for i in range(2)]) for target in label]))
+        scores = [calc_dsc(target, pred) for target in label]
+
+        # 1.0 when undefined see below:
+        # https://openaccess.thecvf.com/content/CVPR2023/papers/Rahman_Ambiguous_Medical_Image_Segmentation_Using_Diffusion_Models_CVPR_2023_paper.pdf
+        scores = [s if not np.isnan(s) else 1.0 for s in scores] 
+        results.append(np.max(scores))
+
+    return results
+
 def compute_dice_nod(predictions, labels):
     results = []
     for pred, label in zip(predictions, labels):
@@ -64,6 +80,7 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
 
     results = {
         "dice": compute_dice(predictions, labels),
+        "dice_max": compute_dice_max(predictions, labels),
         "dice_nod": compute_dice_nod(predictions, labels),
         "ged": ged,
         "sample_diversity": diversity,

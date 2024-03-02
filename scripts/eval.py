@@ -125,23 +125,6 @@ class OracleBoundingBoxDetector(BoundingBoxDetector):
         return bbox
 
 
-from transformers import DetrFeatureExtractor, DetrForObjectDetection  
-
-class DetrBoundingBoxDetector(BoundingBoxDetector):
-    def __init__(self) -> None:
-        self.processor = DetrFeatureExtractor.from_pretrained("facebook/detr-resnet-50", cache_dir="P:/.hf_cache")
-        self.model = DetrForObjectDetection.from_pretrained("data/detr_model", num_queries=1, ignore_mismatched_sizes=True).to("cuda")
-        self.model.eval()
-
-    def get_bounding_box(self, ground_truth_map, add_perturbation=False, image=None):
-        pixel_values = self.processor(images=image, return_tensors="pt")["pixel_values"].to("cuda")
-        outputs = self.model(pixel_values)
-        bbox = outputs.pred_boxes.squeeze().detach().cpu().numpy().tolist()
-        y_size, x_size = ground_truth_map.shape
-        bbox = [bbox[0] * x_size, bbox[1] * y_size, bbox[2] * x_size, bbox[3] * y_size]
-        return bbox
-
-
 class LIDC_IDRI(Dataset):
     images = []
     labels = []
@@ -150,7 +133,6 @@ class LIDC_IDRI(Dataset):
     def __init__(self, dataset_location, processor, transform=None):
         self.transform = transform
         self.processor = processor
-        self.bounding_box_detector = DetrBoundingBoxDetector()
         max_bytes = 2**31 - 1
         data = {}
         for file in os.listdir(dataset_location):
@@ -191,8 +173,7 @@ class LIDC_IDRI(Dataset):
 
         # prepare image and prompt for the model
         image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
-        input_boxes = [[self.bounding_box_detector.get_bounding_box(label, image=image)]]
-        inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
+        inputs = self.processor(image, input_boxes=None, do_rescale=False, return_tensors="pt")
 
         # remove batch dimension which the processor adds by default
         inputs = {k:v.squeeze(0) for k,v in inputs.items()}
@@ -233,13 +214,7 @@ def main():
             do_reduce=False,
         )
 
-    #preprocessing = PreprocessingStrategy.create(args.dataset)()
-    #dataset = preprocessing.preprocess(
-    #    processor, valid_size=constants.VALID_SIZE, 
-    #    test_size=constants.TEST_SIZE, use_bounding_box=args.use_bounding_box
-    #)
-
-    dataset = LIDC_IDRI(dataset_location = 'data/', processor = processor)
+    dataset = LIDC_IDRI(dataset_location='data/', processor=processor)
     dataset_size = len(dataset)
     indices = list(range(dataset_size))
     split = int(np.floor(0.1 * dataset_size))
