@@ -187,8 +187,8 @@ def forward(
         batch_size, num_channels, height, width = image_embeddings.shape
         point_batch_size = sparse_prompt_embeddings.shape[1]
         # Concatenate output tokens
-        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
-        #output_tokens = torch.cat([self.iou_token.weight, sampled_tokens], dim=0)
+        #output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
+        output_tokens = torch.cat([self.iou_token.weight, sampled_tokens], dim=0)
         
         output_tokens = output_tokens.repeat(batch_size, point_batch_size, 1, 1)
 
@@ -227,9 +227,10 @@ def forward(
         hyper_in_list = []
         for i in range(self.num_mask_tokens):
             current_mlp = self.output_hypernetworks_mlps[0]
-            hyper_in_list += [current_mlp(mask_tokens_out[:, :, 0, :])]
+            hyper_in_list += [current_mlp(mask_tokens_out[:, :, i, :])]
         hyper_in = torch.stack(hyper_in_list, dim=2)
 
+        """
         _mean = mean(hyper_in_list[0].squeeze(1))
         _cov = cov(hyper_in_list[0].squeeze(1)).reshape(batch_size, 32, 32)
         Sigma_k = torch.bmm(_cov, _cov.transpose(2, 1))
@@ -240,7 +241,7 @@ def forward(
         for i in range(batch_size):
             dist = MultivariateNormal(_mean[i], Sigma_k[i])
             samples.append(dist.rsample([5]))
-        hyper_in = torch.stack(samples, dim=0).unsqueeze(1)
+        hyper_in = torch.stack(samples, dim=0).unsqueeze(1)"""
 
         _, num_channels, height, width = upscaled_embedding.shape
         upscaled_embedding = upscaled_embedding.reshape(batch_size, point_batch_size, num_channels, height * width)
@@ -267,22 +268,13 @@ def forward(
         return outputs
 
 
-from functools import partial
-from scipy.optimize import linear_sum_assignment
-
-class StochasticSam(Model):
-
+class BlankClassifier(Model):
     def __init__(
-        self,
-        config, 
-        **kwargs
-    ):
-
+        self, 
+        config
+    ) -> None:
         super().__init__(config)
         self.sam = SamModel(config)
-
-        self.mean_predict = nn.Linear(32, 32)
-        self.cov_predict = nn.Linear(32, 32*32)  
 
     def forward(
         self,
@@ -298,38 +290,30 @@ class StochasticSam(Model):
         if image_embeddings is None:
             image_embeddings = self.sam.get_image_embeddings(pixel_values)
 
-        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, mean=self.mean_predict, cov=self.cov_predict)
-        self.sam.mask_decoder.num_mask_tokens = 5
-
         outputs = self.sam(
             image_embeddings=image_embeddings,
             input_boxes=input_boxes,
-            multimask_output=True,
+            multimask_output=False,
         )
-        labels = labels.float()
 
-        loss = 0.0
-        for k in range(outputs.pred_masks.shape[0]):
-            losses = np.zeros((outputs.pred_masks.shape[2], labels.shape[1]), dtype=np.float32)
-            for i in range(outputs.pred_masks.shape[2]):
-                for j in range(labels.shape[1]):
-                    A = outputs.pred_masks[k:k+1, 0, i, :, :]
-                    B = labels[k:k+1, j]
-                    losses[i, j] = (nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)).item()
-            row_ind, col_ind = linear_sum_assignment(losses)
-
-            for i, j in zip(row_ind, col_ind):
-                A = outputs.pred_masks[k:k+1, 0, i, :, :]
-                B = labels[k:k+1, j]
-                loss += nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)
-        
-        loss /= outputs.pred_masks.shape[0]
+        # Create labels for the blank classifier
+        # Should be 0 if no mask is present, 1 if mask is present
+        new_labels = []
+        num_labels = labels.shape[1]
+        for i in range(labels.shape[0]):
+            num_blanks = 0
+            for j in range(num_labels):
+                if labels[i, j].sum() == 0:
+                    num_blanks += 1
+            new_labels.append(1 - (num_blanks / num_labels))
+        new_labels = torch.tensor(new_labels).to(labels.device).float()
+        batch_size = labels.shape[0]
+        loss = nn.BCEWithLogitsLoss()(outputs.iou_scores.reshape(batch_size), new_labels)
 
         return SamMultimaskOutput(
             loss=loss,
             pred_masks=outputs.pred_masks,
-            # Dummy iou_scores required for evaluation code
-            iou_scores=torch.zeros(outputs.pred_masks.shape[0], dtype=torch.float32, device=outputs.pred_masks.device).unsqueeze(1).unsqueeze(1)
+            iou_scores=outputs.iou_scores,
         )
 
 
@@ -473,7 +457,7 @@ class SLIP(Model):
     def _clustering(
         self,
         pred_masks,
-        target_masks,
+        target_masks=None,
         labels=None,
         return_idxs=False,
         probs=None,
@@ -874,3 +858,82 @@ class UNet(nn.Module):
             loss = nn.BCEWithLogitsLoss()(logits.squeeze(1), labels)
         
         return SamMultimaskOutput(loss=loss, iou_scores=iou_scores, pred_masks=logits.unsqueeze(1))
+
+    
+
+from functools import partial
+from scipy.optimize import linear_sum_assignment
+
+class StochasticSam(SLIP):
+
+    def __init__(
+        self,
+        config, 
+        **kwargs
+    ):
+
+        super().__init__(config, **kwargs)
+        self.sam = SamModel(config)
+
+        # Create mean and covariance weights
+        self.dist = nn.Linear(256, 256)
+        self.do_clustering = False
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        input_boxes: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        original_sizes: Optional[torch.Tensor] = None,
+        reshaped_input_sizes: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+
+        if image_embeddings is None:
+            image_embeddings = self.sam.get_image_embeddings(pixel_values)
+
+        # Sample from multivariate normal distribution
+        Sigma_k = torch.mm(self.dist.weight, self.dist.weight.T)
+        Sigma_k.add_(torch.eye(256).to(Sigma_k.device))
+        
+        dist = MultivariateNormal(self.dist.bias, Sigma_k)
+        sampled_tokens = dist.rsample([self.num_simulations + 1])
+        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=sampled_tokens)
+        self.sam.mask_decoder.num_mask_tokens = self.num_simulations + 1
+
+        outputs = self.sam(
+            image_embeddings=image_embeddings,
+            input_boxes=input_boxes,
+            multimask_output=True,
+        )
+        labels = labels.float()
+
+        loss = 0.0
+        for k in range(outputs.pred_masks.shape[0]):
+            losses = np.zeros((outputs.pred_masks.shape[2], labels.shape[1]), dtype=np.float32)
+            for i in range(outputs.pred_masks.shape[2]):
+                for j in range(labels.shape[1]):
+                    A = outputs.pred_masks[k:k+1, 0, i, :, :]
+                    B = labels[k:k+1, j]
+                    losses[i, j] = (nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)).item()
+            row_ind, col_ind = linear_sum_assignment(losses)
+
+            for i, j in zip(row_ind, col_ind):
+                A = outputs.pred_masks[k:k+1, 0, i, :, :]
+                B = labels[k:k+1, j]
+                loss += nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)
+        
+        loss /= outputs.pred_masks.shape[0] * outputs.pred_masks.shape[2]
+
+        if self.do_clustering:
+            # Find intersection between all masks along dim 2
+            outputs.pred_masks = self._clustering(outputs.pred_masks)
+
+        return SamMultimaskOutput(
+            loss=loss,
+            pred_masks=outputs.pred_masks,
+            # Dummy iou_scores required for evaluation code
+            iou_scores=torch.zeros(outputs.pred_masks.shape[0], dtype=torch.float32, device=outputs.pred_masks.device).unsqueeze(1).unsqueeze(1)
+        )
+

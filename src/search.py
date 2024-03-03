@@ -151,7 +151,7 @@ class State:
         for i in range(len(D)):
             D[i, i] = 1.0
 
-        return - np.mean(np.max(D, axis=0), axis=-1).item()
+        return np.mean(np.max(self.scores[self.chosen_idxs], axis=-1)) - np.mean(np.max(D, axis=0), axis=-1).item()
          
 
     def __hash__(self):

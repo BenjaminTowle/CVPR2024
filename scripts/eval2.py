@@ -41,7 +41,7 @@ os.environ["WANDB_DISABLED"] = "true"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="data/checkpoint-epoch4",
+        default="data/checkpoint-hungarian",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -67,7 +67,7 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="slip",
+        default="stochastic",
         metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic"]}
     )
 
@@ -92,7 +92,7 @@ class ModelArguments:
     )
 
     num_simulations: int = field(
-        default=10,
+        default=50,
         metadata={"help": "Number of simulations for SLIP"}
     )
 
@@ -246,7 +246,7 @@ def _main(args):
         model = StochasticSam.from_pretrained(
             args.model_load_path,
             processor=processor,
-            multimask_output=True
+            num_simulations=args.num_simulations
         )
 
     elif args.model_type == "unet":

@@ -23,7 +23,7 @@ import torch
 from src import constants
 from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
-from src.modeling import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam
+from src.modeling import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier
 from src.utils import set_seed
 
 if not os.path.exists("data"):
@@ -41,7 +41,7 @@ os.environ["WANDB_DISABLED"] = "true"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="wanglab/medsam-vit-base",
+        default="data/checkpoint-epoch4",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -68,7 +68,7 @@ class ModelArguments:
 
     model_type: str = field(
         default="stochastic",
-        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic"]}
+        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier"]}
     )
 
     learning_rate: float = field(
@@ -115,6 +115,9 @@ def get_bounding_box(ground_truth_map, add_perturbation=False):
     bbox = [x_min, y_min, x_max, y_max]
 
     return bbox
+
+
+import random
 
 class LIDC_IDRI(Dataset):
     images = []
@@ -185,7 +188,7 @@ class LIDC_IDRI(Dataset):
         # Prepare image and prompt for the model
         if self.processor is not None:
             image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
-            input_boxes = [[get_bounding_box(label[0])]] if self.use_bounding_box else None
+            input_boxes = [[get_bounding_box(label[random.randint(0, 3)], add_perturbation=True)]] if self.use_bounding_box else None
             inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
             # remove batch dimension which the processor adds by default
             inputs = {k:v.squeeze(0) for k,v in inputs.items()}
@@ -216,7 +219,7 @@ class LIDC_IDRI(Dataset):
 
 def _main(args):
     # Load dataset
-    processor = SamProcessor.from_pretrained(args.model_load_path) if args.model_type != "unet" else None
+    processor = SamProcessor.from_pretrained(args.processor_load_path) if args.model_type != "unet" else None
 
     # Load model
     if args.model_type == "slip":
@@ -246,11 +249,15 @@ def _main(args):
         model = StochasticSam.from_pretrained(
             args.model_load_path,
             processor=processor,
-            multimask_output=True
         )
 
     elif args.model_type == "unet":
         model = UNet()
+
+    elif args.model_type == "classifier":
+        model = BlankClassifier.from_pretrained(
+            args.model_load_path,
+        )
 
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
@@ -298,7 +305,7 @@ def _main(args):
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["valid"],
-        compute_metrics=compute_metrics if args.model_type != "theta" else None,
+        compute_metrics=compute_metrics if args.model_type not in ["theta", "classifier"] else None,
     )
 
     trainer.train()
