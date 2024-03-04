@@ -41,7 +41,7 @@ os.environ["WANDB_DISABLED"] = "true"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="data/checkpoint-epoch4",
+        default="wanglab/medsam-vit-base",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -249,6 +249,7 @@ def _main(args):
         model = StochasticSam.from_pretrained(
             args.model_load_path,
             processor=processor,
+            num_simulations=20,
         )
 
     elif args.model_type == "unet":

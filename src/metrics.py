@@ -90,7 +90,9 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
         with open(write_path, "w") as f:
             json.dump(results, f)
 
-    results = {name: np.mean(result) for name, result in results.items()}
+    mean_results = {f"{name}_mean": np.mean(result) for name, result in results.items()}
+    std_results = {f"{name}_std": np.std(result) for name, result in results.items()}
+    results = {**mean_results, **std_results}
 
     return results
 

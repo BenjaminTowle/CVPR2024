@@ -863,21 +863,24 @@ class UNet(nn.Module):
 
 from functools import partial
 from scipy.optimize import linear_sum_assignment
+import math
 
 class StochasticSam(SLIP):
 
     def __init__(
         self,
         config, 
+        do_clustering: bool = False,
         **kwargs
     ):
 
+        self.do_clustering = do_clustering
         super().__init__(config, **kwargs)
         self.sam = SamModel(config)
 
         # Create mean and covariance weights
         self.dist = nn.Linear(256, 256)
-        self.do_clustering = False
+        #self.dist.bias.data = self.sam.mask_decoder.mask_tokens.weight[0] # Initialize mean to first mask token
 
     def forward(
         self,
@@ -909,6 +912,7 @@ class StochasticSam(SLIP):
         )
         labels = labels.float()
 
+        """
         loss = 0.0
         for k in range(outputs.pred_masks.shape[0]):
             losses = np.zeros((outputs.pred_masks.shape[2], labels.shape[1]), dtype=np.float32)
@@ -925,6 +929,14 @@ class StochasticSam(SLIP):
                 loss += nn.BCEWithLogitsLoss()(A, B) + monai.losses.DiceLoss(sigmoid=True)(A, B)
         
         loss /= outputs.pred_masks.shape[0] * outputs.pred_masks.shape[2]
+        """
+        batch_size = outputs.pred_masks.shape[0]
+        num_mc_samples = outputs.pred_masks.shape[2]
+        logit_sample = outputs.pred_masks.reshape((batch_size * num_mc_samples, -1))
+        target = labels[:, :1].expand(-1, num_mc_samples, -1, -1).reshape((batch_size * num_mc_samples, -1))
+        log_prob = -F.cross_entropy(logit_sample, target, reduction='none').reshape((batch_size, num_mc_samples, -1))
+        loglikelihood = torch.mean(torch.logsumexp(torch.sum(log_prob, dim=-1), dim=1) - math.log(num_mc_samples))
+        loss = -loglikelihood / (labels.shape[-1] * labels.shape[-2])
 
         if self.do_clustering:
             # Find intersection between all masks along dim 2
@@ -933,7 +945,5 @@ class StochasticSam(SLIP):
         return SamMultimaskOutput(
             loss=loss,
             pred_masks=outputs.pred_masks,
-            # Dummy iou_scores required for evaluation code
             iou_scores=torch.zeros(outputs.pred_masks.shape[0], dtype=torch.float32, device=outputs.pred_masks.device).unsqueeze(1).unsqueeze(1)
         )
-

@@ -41,7 +41,7 @@ os.environ["WANDB_DISABLED"] = "true"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="data/checkpoint-hungarian",
+        default="data/checkpoint-2000-ssn",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -92,7 +92,7 @@ class ModelArguments:
     )
 
     num_simulations: int = field(
-        default=50,
+        default=4,
         metadata={"help": "Number of simulations for SLIP"}
     )
 
@@ -246,7 +246,8 @@ def _main(args):
         model = StochasticSam.from_pretrained(
             args.model_load_path,
             processor=processor,
-            num_simulations=args.num_simulations
+            num_simulations=args.num_simulations,
+            do_clustering=False
         )
 
     elif args.model_type == "unet":
@@ -266,7 +267,7 @@ def _main(args):
     #dataset["train"] = Subset(dataset["train"], list(range(1000)))
 
     # Downsample the test set to 100 samples for debugging
-    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+    #dataset["valid"] = Subset(dataset["valid"], list(range(100)))
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
