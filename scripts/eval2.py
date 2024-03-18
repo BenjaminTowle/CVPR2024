@@ -41,7 +41,7 @@ os.environ["WANDB_DISABLED"] = "true"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="data/checkpoint-2000-ssn",
+        default="data/checkpoint-final",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -67,7 +67,7 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="stochastic",
+        default="slip",
         metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic"]}
     )
 
@@ -92,7 +92,7 @@ class ModelArguments:
     )
 
     num_simulations: int = field(
-        default=4,
+        default=20,
         metadata={"help": "Number of simulations for SLIP"}
     )
 
@@ -247,7 +247,8 @@ def _main(args):
             args.model_load_path,
             processor=processor,
             num_simulations=args.num_simulations,
-            do_clustering=False
+            do_clustering=False,
+            num_preds=4
         )
 
     elif args.model_type == "unet":
@@ -267,7 +268,7 @@ def _main(args):
     #dataset["train"] = Subset(dataset["train"], list(range(1000)))
 
     # Downsample the test set to 100 samples for debugging
-    #dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+    dataset["valid"] = Subset(dataset["valid"], list(range(50)))
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
@@ -299,7 +300,7 @@ def _main(args):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset["train"],
+        train_dataset=dataset["valid"],
         eval_dataset=dataset["valid"],
         compute_metrics=compute_metrics if args.model_type != "theta" else None,
     )

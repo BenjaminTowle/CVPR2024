@@ -1,8 +1,9 @@
 accelerate
 datasets
+nvidia-ml-py3
 medpy
 monai
-numpy
+numpy==1.23.4
 opencv-python
 pydicom
 transformers

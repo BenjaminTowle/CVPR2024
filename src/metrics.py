@@ -15,7 +15,11 @@ def compute_dice(predictions, labels):
         label = label.astype(np.int64)
         #results.append(
             #np.mean([np.mean([dice(target == i, pred == i) for i in range(2)]) for target in label]))
-        results.append(np.mean([calc_dsc(target, pred) for target in label]))
+        scores = [calc_dsc(target, pred) for target in label]
+        # 0.0 when undefined
+        scores = [s if not np.isnan(s) else 0.0 for s in scores] 
+        results.append(np.mean(scores))
+        #results.append(np.mean([calc_dsc(target, pred) for target in label]))
 
     results = [result if not np.isnan(result) else 0.0 for result in results ]
 
@@ -63,6 +67,16 @@ def compute_ged(predictions, labels):
 
     return _geds, diversities
 
+def compute_blanks(predictions, labels):
+    pred_blanks = []
+    label_blanks = []
+    for pred, label in zip(predictions, labels):
+        for p, l in zip(pred, label):
+            pred_blanks.append(float((np.sum(p) == 0)))
+            label_blanks.append(float((np.sum(l) == 0)))
+    
+    return pred_blanks, label_blanks
+
 def compute_metrics(eval_pred, write_path: str = "data/results.json"): 
     predictions = eval_pred.predictions[1]
     labels = eval_pred.label_ids.astype(bool)
@@ -77,6 +91,7 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
 
     predictions = predictions.squeeze(1)
     ged, diversity = compute_ged(predictions, labels)
+    pred_blanks, label_blanks = compute_blanks(predictions, labels)
 
     results = {
         "dice": compute_dice(predictions, labels),
@@ -84,6 +99,8 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
         "dice_nod": compute_dice_nod(predictions, labels),
         "ged": ged,
         "sample_diversity": diversity,
+        "pred_blanks": pred_blanks,
+        "label_blanks": label_blanks
     }
 
     if write_path is not None:

@@ -23,7 +23,8 @@ import torch
 from src import constants
 from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
-from src.modeling import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier
+from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier
+from src.modeling.probabilistic import ProbabilisticSam
 from src.utils import set_seed
 
 if not os.path.exists("data"):
@@ -38,15 +39,18 @@ logging.set_verbosity_info()
 set_caching_enabled(False)
 os.environ["WANDB_DISABLED"] = "true"
 
+MEDSAM = "wanglab/medsam-vit-base"
+SAM = "facebook/sam-vit-base"
+
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="wanglab/medsam-vit-base",
+        default=MEDSAM,
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
     processor_load_path: str = field(
-        default="facebook/sam-vit-base",
+        default=SAM,
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -246,10 +250,9 @@ def _main(args):
         model.set_env(env)
 
     elif args.model_type == "stochastic":
-        model = StochasticSam.from_pretrained(
+        model = ProbabilisticSam.from_pretrained(
             args.model_load_path,
             processor=processor,
-            num_simulations=20,
         )
 
     elif args.model_type == "unet":
@@ -274,14 +277,14 @@ def _main(args):
     #dataset["train"] = Subset(dataset["train"], list(range(1000)))
 
     # Downsample the test set to 100 samples for debugging
-    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+    dataset["valid"] = Subset(dataset["valid"], list(range(500)))
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
  
     # Make sure we only compute gradients for mask decoder
     for name, param in model.named_parameters():
-        if name.startswith("sam.vision_encoder") or name.startswith("sam.prompt_encoder"):
+        if name.startswith("sam.vision_encoder"): # or name.startswith("sam.prompt_encoder"):
             param.requires_grad_(False)
     
     # Set up trainer
@@ -295,8 +298,9 @@ def _main(args):
         logging_dir="./logs",
         logging_steps=10,
         evaluation_strategy="steps",
-        eval_steps=100,
+        eval_steps=200,
         save_strategy="no",
+        #fp16=True,
         #save_total_limit=1,
         learning_rate=args.learning_rate,
     )
@@ -309,6 +313,7 @@ def _main(args):
         compute_metrics=compute_metrics if args.model_type not in ["theta", "classifier"] else None,
     )
 
+    trainer.evaluate()
     trainer.train()
 
     if args.model_type == "theta":
