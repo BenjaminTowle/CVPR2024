@@ -1,10 +1,9 @@
-accelerate
 datasets
-nvidia-ml-py3
 medpy
 monai
 numpy==1.23.4
 opencv-python
+pillow
 pydicom
 transformers
 gdown

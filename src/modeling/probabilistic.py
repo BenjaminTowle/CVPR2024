@@ -257,7 +257,7 @@ class ProbabilisticSam(SamPreTrainedModel):
         config, 
         input_channels=3,
         num_filters=[32, 64, 128, 192, 192, 192, 192],
-        latent_dim=256,
+        latent_dim=6,
         beta=10.0,
         **kwargs
     ):
@@ -279,11 +279,11 @@ class ProbabilisticSam(SamPreTrainedModel):
         self.prior = AxisAlignedConvGaussian(self.input_channels, self.num_filters, self.no_convs_per_block, self.latent_dim,  self.initializers,)
         self.posterior = AxisAlignedConvGaussian(self.input_channels, self.num_filters, self.no_convs_per_block, self.latent_dim, self.initializers, posterior=True)
 
-        #self.upscale = nn.Linear(self.latent_dim, 256) # Additional layer required to scale up the latent space to the same size as the image embeddings
+        self.upscale = nn.Linear(self.latent_dim, 256) # Additional layer required to scale up the latent space to the same size as the image embeddings
 
     def sample(self, image_embeddings, input_boxes=None):
         z_prior = self.prior_latent_space.sample()
-        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=z_prior)
+        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=self.upscale(z_prior))
         outputs = self.sam(
             image_embeddings=image_embeddings,
             input_boxes=input_boxes,
@@ -305,7 +305,7 @@ class ProbabilisticSam(SamPreTrainedModel):
             if calculate_posterior:
                 z_posterior = self.posterior_latent_space.rsample()
         
-        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=z_posterior)
+        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=self.upscale(z_posterior))
         outputs = self.sam(
             image_embeddings=image_embeddings,
             input_boxes=input_boxes,

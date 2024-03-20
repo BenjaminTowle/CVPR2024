@@ -25,6 +25,7 @@ from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
 from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier
 from src.modeling.probabilistic import ProbabilisticSam
+from src.modeling.ssn import SsnSam
 from src.utils import set_seed
 
 if not os.path.exists("data"):
@@ -167,10 +168,11 @@ class LIDC_IDRI(Dataset):
                 new_data = pickle.loads(bytes_in)
                 data.update(new_data)
         
-        for key, value in data.items():
+        for i, (key, value) in enumerate(data.items()):
             self.images.append(value['image'].astype(float))
             self.labels.append(value['masks'])
             self.series_uid.append(value['series_uid'])
+
 
         assert (len(self.images) == len(self.labels) == len(self.series_uid))
 
@@ -183,6 +185,7 @@ class LIDC_IDRI(Dataset):
         del data
 
     def __getitem__(self, index):
+        index = index[0]
         image = np.expand_dims(self.images[index], axis=0)
         label = np.stack(self.labels[index]).astype(float)
         
@@ -214,6 +217,8 @@ class LIDC_IDRI(Dataset):
                 input_masks, size=(256, 256), 
                 mode="bilinear", align_corners=False
             ).squeeze(0)
+
+        inputs = {key: s.unsqueeze(0) for key, s in inputs.items()}
         
         return inputs
 
@@ -250,7 +255,7 @@ def _main(args):
         model.set_env(env)
 
     elif args.model_type == "stochastic":
-        model = ProbabilisticSam.from_pretrained(
+        model = SsnSam.from_pretrained(
             args.model_load_path,
             processor=processor,
         )
@@ -291,7 +296,7 @@ def _main(args):
     training_args = TrainingArguments(
         output_dir="./results",
         num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         dataloader_drop_last=False,
         weight_decay=0.01,
