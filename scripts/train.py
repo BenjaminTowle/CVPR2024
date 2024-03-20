@@ -1,6 +1,7 @@
 import sys
 import os
 import gdown
+import random
 sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
 from datasets import set_caching_enabled    
@@ -122,8 +123,6 @@ def get_bounding_box(ground_truth_map, add_perturbation=False):
     return bbox
 
 
-import random
-
 class LIDC_IDRI(Dataset):
     images = []
     labels = []
@@ -135,23 +134,14 @@ class LIDC_IDRI(Dataset):
         processor=None, 
         transform=None, 
         use_bounding_box=True, 
-        use_input_masks=True,
         multilabel=True
     ):
         self.transform = transform
         self.processor = processor
         self.use_bounding_box = use_bounding_box
-        self.use_input_masks = use_input_masks
         self.multilabel = multilabel
 
         self.model = None
-        if use_input_masks:
-            from safetensors.torch import load_file
-            file_path = 'data/checkpoint-42500/model.safetensors'
-            loaded = load_file(file_path)
-            model = UNet()
-            model.load_state_dict(loaded)
-            self.model = model
         
         max_bytes = 2**31 - 1
         data = {}
@@ -184,41 +174,29 @@ class LIDC_IDRI(Dataset):
         del new_data
         del data
 
-    def __getitem__(self, index):
-        index = index[0]
-        image = np.expand_dims(self.images[index], axis=0)
-        label = np.stack(self.labels[index]).astype(float)
-        
-        if self.transform is not None:
-            image = self.transform(image)
+        self.num_labels = 4
 
+    def __getitem__(self, indices):
+        bsz = len(indices)
+        image = np.stack([self.images[index] for index in indices], axis=0)
+        label = np.stack([
+            self.labels[index][random.randint(0, self.num_labels-1)] for index in indices]).astype(float)
+        
         # Prepare image and prompt for the model
         if self.processor is not None:
-            image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
-            input_boxes = [[get_bounding_box(label[random.randint(0, 3)], add_perturbation=True)]] if self.use_bounding_box else None
-            inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
-            # remove batch dimension which the processor adds by default
-            inputs = {k:v.squeeze(0) for k,v in inputs.items()}
-            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
-            #inputs["reshaped_input_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+            image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
+            #input_boxes = [[get_bounding_box(label[random.randint(0, 3)], add_perturbation=True)]] if self.use_bounding_box else None
+            inputs = self.processor(image, do_rescale=False, return_tensors="pt")
+
+            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
             
             inputs["labels"] = F.interpolate(
-                torch.tensor(label).unsqueeze(0), 
+                torch.tensor(label).unsqueeze(1),  # Add channel dimension 
                 size=(256, 256), 
                 mode="nearest"
-            ).bool().squeeze()
+            ).bool().squeeze(1)
         else:
             inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
-
-        if self.use_input_masks:
-            unet_input = torch.from_numpy(image[..., 0]).view(1, 1, *image.shape[:2]).float()  
-            input_masks = self.model(unet_input).pred_masks.squeeze(1)
-            inputs["input_masks"] = F.interpolate(
-                input_masks, size=(256, 256), 
-                mode="bilinear", align_corners=False
-            ).squeeze(0)
-
-        inputs = {key: s.unsqueeze(0) for key, s in inputs.items()}
         
         return inputs
 
@@ -271,7 +249,7 @@ def _main(args):
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
 
-    dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box, use_input_masks=args.use_input_masks)
+    dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
     dataset_size = len(dataset)
     indices = list(range(dataset_size))
     split = int(np.floor(0.1 * dataset_size))
@@ -296,8 +274,8 @@ def _main(args):
     training_args = TrainingArguments(
         output_dir="./results",
         num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
         dataloader_drop_last=False,
         weight_decay=0.01,
         logging_dir="./logs",

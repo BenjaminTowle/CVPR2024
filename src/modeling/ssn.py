@@ -87,9 +87,14 @@ class SsnSam(SamPreTrainedModel):
 
         batch_size = mean.shape[0]
         num_mc_samples = 20 if self.training else 3
-        m = LowRankMultivariateNormal(mean, cov_factor, log_cov_diag)
-        sample = m.rsample([num_mc_samples]).reshape(-1, num_pixels)
-        target = labels[:, :1].expand(-1, num_mc_samples, -1, -1).reshape((batch_size * num_mc_samples, -1)).float()
+        
+        try:
+            m = LowRankMultivariateNormal(mean, cov_factor, log_cov_diag)
+            sample = m.rsample([num_mc_samples]).reshape(-1, num_pixels)
+        except:
+            sample = mean.unsqueeze(1).expand(-1, num_mc_samples, -1).reshape(-1, num_pixels)
+
+        target = labels.unsqueeze(1).expand(-1, num_mc_samples, -1, -1).reshape((batch_size * num_mc_samples, -1)).float()
         log_prob = -F.cross_entropy(sample, target, reduction='none').reshape((batch_size, num_mc_samples, -1))
         loglikelihood = torch.mean(torch.logsumexp(torch.sum(log_prob, dim=-1), dim=1) - math.log(num_mc_samples))
         loss = -loglikelihood / (labels.shape[-1] * labels.shape[-2])

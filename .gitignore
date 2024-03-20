@@ -6,3 +6,4 @@ wandb/
 logs/
 .vscode/
 version.py
+.venv/
