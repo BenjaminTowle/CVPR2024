@@ -151,9 +151,10 @@ class State:
         for i in range(len(D)):
             D[i, i] = 1.0
 
+        #return -1 * np.mean(D).item()
         #return np.mean(np.max(self.scores[self.chosen_idxs], axis=-1)) - np.mean(np.max(D, axis=0), axis=-1).item()
-        return np.mean(self.scores[self.chosen_idxs]) - np.abs(np.mean(D).item() - 0.399) #- np.mean(self.scores)
-         
+        #return np.mean(self.scores[self.chosen_idxs]) #- np.abs(np.mean(D).item() - 0.399) #- np.mean(self.scores)
+        return np.mean(self.scores[self.chosen_idxs]) - np.mean(D)
 
     def __hash__(self):
         return hash(tuple(self.chosen_idxs))

@@ -121,9 +121,19 @@ class SamBaseline(Model):
         labels: Optional[torch.Tensor] = None,
         original_sizes: Optional[torch.Tensor] = None,
         reshaped_input_sizes: Optional[torch.Tensor] = None,
+        label_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
 
+        new_labels = []
+        for i in range(len(labels)):
+            while True:
+                rand_idx = random.randint(0, labels.shape[1] - 1) 
+                if label_mask[i, rand_idx] > 0:
+                    break
+            new_labels.append(labels[i, rand_idx])
+        labels = torch.stack(new_labels, dim=0).to(self.device)
+        
         if image_embeddings is None:
             image_embeddings = self.sam.get_image_embeddings(pixel_values)
 
@@ -139,9 +149,9 @@ class SamBaseline(Model):
             loss_fn=self.seg_loss, 
             return_dict=True
         )        
-        _iou_loss= self.iou_loss(outputs.pred_masks, outputs.iou_scores, labels)
+        #_iou_loss= self.iou_loss(outputs.pred_masks, outputs.iou_scores, labels)
 
-        loss = loss["loss"] + _iou_loss
+        loss = loss["loss"] #+ _iou_loss
 
         return SamMultimaskOutput(
             loss=loss,
@@ -214,7 +224,7 @@ class SLIP(Model):
         config, 
         processor, 
         num_simulations: int = 50, 
-        num_preds: int = 4,
+        num_preds: int = 3,
         num_iterations: int = 5,
         num_mc_samples: int = 1,
         tau=0.7,
@@ -328,7 +338,7 @@ class SLIP(Model):
         if self.training:
             input_points, input_labels = zip(*map(lambda i: self.get_click_training(
                 pred_mask=pred_masks[i],
-                label=labels[i, random.randint(0, 3)] if labels is not None else None,
+                label=labels[i] if labels is not None else None,
             ), range(pred_masks.size(0))))
 
         else:
@@ -351,7 +361,19 @@ class SLIP(Model):
         original_sizes: torch.Tensor,
         reshaped_input_sizes: torch.Tensor, 
         labels: torch.Tensor,
+        label_mask: torch.Tensor
     ):
+
+        all_labels = labels
+        new_labels = []
+        for i in range(len(labels)):
+            while True:
+                rand_idx = random.randint(0, labels.shape[1] - 1) 
+                if label_mask[i, rand_idx] > 0:
+                    break
+            new_labels.append(labels[i, rand_idx])
+        labels = torch.stack(new_labels, dim=0).to(self.device)
+        
 
         old_strategy = self.click_strategy
         self.set_click_strategy("training")
@@ -390,8 +412,8 @@ class SLIP(Model):
             )
 
             binary_input_mask = (world_outputs.pred_masks > 0.0).squeeze(1).squeeze(1).detach()
-            fn_masks = torch.logical_and(binary_input_mask == 0, labels[:, 0] == 1).float()
-            fp_masks = torch.logical_and(binary_input_mask == 1, labels[:, 0] == 0).float()
+            fn_masks = torch.logical_and(binary_input_mask == 0, labels == 1).float()
+            fp_masks = torch.logical_and(binary_input_mask == 1, labels == 0).float()
 
             fn_pred = policy_outputs.pred_masks[:, 0, 0]
             fp_pred = policy_outputs.pred_masks[:, 0, 1]
@@ -427,6 +449,35 @@ class SLIP(Model):
             pred_masks, idxs, pred_iou = self._clustering(pred_masks, return_idxs=True)
             iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
 
+        
+        # Create labels for the blank classifier
+        # Should be 0 if no mask is present, 1 if mask is present
+        
+        if self.training:
+            new_labels = []
+            num_labels = all_labels.shape[1]
+            for i in range(all_labels.shape[0]):
+                num_blanks = 0
+                for j in range(num_labels):
+                    if all_labels[i, j].sum() == 0:
+                        num_blanks += 1
+                new_labels.append(1 - (num_blanks / num_labels))
+            new_labels = torch.tensor(new_labels).to(labels.device).float()
+            iou_loss = nn.BCEWithLogitsLoss()(world_outputs.iou_scores.reshape(all_labels.shape[0]), new_labels)
+
+            #total_loss += iou_loss
+
+        """
+        if not self.training:
+            iou_scores = world_outputs.iou_scores.reshape([batch_size, self.num_mc_samples]).mean(-1)
+            for i in range(batch_size):
+                num_blanks = torch.round((1 - torch.sigmoid(iou_scores[i])) * self.num_preds).int()
+                
+                # [:, :, -0:] will give entire array not empty array
+                if num_blanks == 0:
+                    continue
+                pred_masks[:, :, -num_blanks:] = -1 * torch.inf"""
+        
         self.set_click_strategy(old_strategy)
 
         return SamMultimaskOutput(
@@ -572,7 +623,7 @@ class SLIP(Model):
                 loss += self.loss_fn(pred_masks, labels[:, i])
             return loss / labels.shape[1]
         
-        return self.loss_fn(pred_masks, labels[:, 0])
+        return self.loss_fn(pred_masks, labels)
 
     def forward(
         self, 
@@ -580,9 +631,11 @@ class SLIP(Model):
         image_embeddings=None,
         input_boxes=None,
         labels=None,
+        label_mask=None,
         original_sizes=None,
         reshaped_input_sizes=None,
     ):
+        
         
         if image_embeddings is None:
             image_embeddings = self.sam.get_image_embeddings(pixel_values)
@@ -593,6 +646,7 @@ class SLIP(Model):
             "original_sizes": original_sizes,
             "reshaped_input_sizes": reshaped_input_sizes,
             "labels": labels,
+            "label_mask": label_mask
         }
         
         if self.training:

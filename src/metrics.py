@@ -79,7 +79,7 @@ def compute_blanks(predictions, labels):
 
 def compute_metrics(eval_pred, write_path: str = "data/results.json"): 
     predictions = eval_pred.predictions[1]
-    labels = eval_pred.label_ids.astype(bool)
+    labels = eval_pred.label_ids[0].astype(bool)
     non_empty_predictions = []
     non_empty_labels = []
     for prediction, label in zip(predictions, labels):
@@ -88,6 +88,9 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
             non_empty_labels.append(label)
     non_empty_predictions = np.array(non_empty_predictions)
     non_empty_labels = np.array(non_empty_labels)
+
+    #predictions = non_empty_predictions
+    labels = non_empty_labels
 
     predictions = predictions.squeeze(1)
     ged, diversity = compute_ged(predictions, labels)

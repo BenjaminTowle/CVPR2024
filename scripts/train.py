@@ -47,7 +47,7 @@ SAM = "facebook/sam-vit-base"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default=MEDSAM,
+        default=SAM,
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -73,7 +73,7 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="stochastic",
+        default="slip",
         metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier"]}
     )
 
@@ -88,7 +88,7 @@ class ModelArguments:
     )
 
     use_bounding_box: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to use bounding boxes"}
     )
 
@@ -177,26 +177,58 @@ class LIDC_IDRI(Dataset):
         self.num_labels = 4
 
     def __getitem__(self, indices):
-        bsz = len(indices)
-        image = np.stack([self.images[index] for index in indices], axis=0)
-        label = np.stack([
-            self.labels[index][random.randint(0, self.num_labels-1)] for index in indices]).astype(float)
-        
-        # Prepare image and prompt for the model
-        if self.processor is not None:
-            image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
-            #input_boxes = [[get_bounding_box(label[random.randint(0, 3)], add_perturbation=True)]] if self.use_bounding_box else None
-            inputs = self.processor(image, do_rescale=False, return_tensors="pt")
+        if type(indices) == int:
+            index = indices
+            image = np.expand_dims(self.images[index], axis=0)
+            label = self.labels[index][random.randint(0, self.num_labels-1)].astype(float)
 
-            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
-            
+            image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
+            inputs = self.processor(image, do_rescale=False, return_tensors="pt")
+            # remove batch dimension which the processor adds by default
+            inputs = {k:v.squeeze(0) for k,v in inputs.items()}
+            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+
             inputs["labels"] = F.interpolate(
-                torch.tensor(label).unsqueeze(1),  # Add channel dimension 
+                torch.tensor(label).unsqueeze(0).unsqueeze(0),  
                 size=(256, 256), 
                 mode="nearest"
-            ).bool().squeeze(1)
+            ).bool().squeeze()
         else:
-            inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
+            bsz = len(indices)
+            image = np.stack([self.images[index] for index in indices], axis=0)
+            label = np.stack([
+                self.labels[index] for index in indices]).astype(float)
+            
+            # Prepare image and prompt for the model
+            if self.processor is not None:
+                image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
+                input_boxes = None
+                if self.use_bounding_box:
+                    input_boxes = []
+                    for l in label:
+                        while True:
+                            idx = random.randint(0, 3)
+                            if l[idx].sum() > 0:
+                                break
+                        input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
+                
+                #input_boxes = [[get_bounding_box(l[random.randint(0, 3)], add_perturbation=True)] for l in label] if self.use_bounding_box else None
+                inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
+
+                inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
+                
+                inputs["labels"] = F.interpolate(
+                    torch.tensor(label), 
+                    size=(256, 256), 
+                    mode="nearest"
+                ).bool().squeeze(1)
+
+                # Create a mask for labels that are blank
+                inputs["label_mask"] = torch.sum(inputs["labels"], dim=(-1, -2)) > 0
+
+
+            else:
+                inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
         
         return inputs
 
@@ -214,7 +246,8 @@ def _main(args):
             args.model_load_path, 
             processor,
             num_simulations=args.num_simulations,
-            cache_dir=constants.CACHE_DIR
+            cache_dir=constants.CACHE_DIR,
+            multiple_annotations=False
         )
 
     elif args.model_type == "baseline":
@@ -260,7 +293,7 @@ def _main(args):
     #dataset["train"] = Subset(dataset["train"], list(range(1000)))
 
     # Downsample the test set to 100 samples for debugging
-    dataset["valid"] = Subset(dataset["valid"], list(range(500)))
+    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
