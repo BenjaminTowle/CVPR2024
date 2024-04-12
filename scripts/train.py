@@ -24,7 +24,7 @@ import torch
 from src import constants
 from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
-from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier
+from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier, ZcaSam
 from src.modeling.probabilistic import ProbabilisticSam
 from src.modeling.ssn import SsnSam
 from src.utils import set_seed
@@ -73,8 +73,8 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="slip",
-        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier"]}
+        default="zca",
+        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier", "zca"]}
     )
 
     learning_rate: float = field(
@@ -83,7 +83,7 @@ class ModelArguments:
     )
 
     num_train_epochs: int = field(
-        default=10,
+        default=1,
         metadata={"help": "Number of training epochs"}
     )
 
@@ -279,18 +279,23 @@ def _main(args):
             args.model_load_path,
         )
 
+    elif args.model_type == "zca":
+        model = ZcaSam.from_pretrained(
+            args.model_load_path,
+        )
+
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
 
     dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
     dataset_size = len(dataset)
     indices = list(range(dataset_size))
-    split = int(np.floor(0.1 * dataset_size))
-    train_indices, test_indices = indices[split:], indices[:split]
-    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, test_indices)}
+    split = int(np.floor(0.2 * dataset_size))
+    train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
+    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, valid_indices)}
 
     # Downsample the training set to 1000 samples for debugging
-    #dataset["train"] = Subset(dataset["train"], list(range(1000)))
+    dataset["train"] = Subset(dataset["train"], list(range(100)))
 
     # Downsample the test set to 100 samples for debugging
     dataset["valid"] = Subset(dataset["valid"], list(range(100)))
@@ -305,17 +310,17 @@ def _main(args):
     
     # Set up trainer
     training_args = TrainingArguments(
-        output_dir="./results",
-        num_train_epochs=args.num_train_epochs,
+        output_dir=args.model_save_path,
+        num_train_epochs=10,
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         dataloader_drop_last=False,
         weight_decay=0.01,
         logging_dir="./logs",
         logging_steps=10,
-        evaluation_strategy="steps",
+        evaluation_strategy="epoch",
         eval_steps=200,
-        save_strategy="no",
+        save_strategy="epoch",
         #fp16=True,
         #save_total_limit=1,
         learning_rate=args.learning_rate,

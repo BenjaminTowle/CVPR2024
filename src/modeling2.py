@@ -916,8 +916,8 @@ def forward(
         batch_size, num_channels, height, width = image_embeddings.shape
         point_batch_size = sparse_prompt_embeddings.shape[1]
         # Concatenate output tokens
-        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
-        #output_tokens = torch.cat([self.iou_token.weight, sampled_tokens], dim=0)
+        #output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
+        output_tokens = torch.cat([self.iou_token.weight, sampled_tokens], dim=0)
         
         output_tokens = output_tokens.repeat(batch_size, point_batch_size, 1, 1)
 
@@ -954,11 +954,12 @@ def forward(
         upscaled_embedding = self.activation(self.upscale_conv2(upscaled_embedding))
 
         hyper_in_list = []
-        for i in range(1):
-            current_mlp = self.output_hypernetworks_mlps[0]
+        for i in range(self.num_mask_tokens):
+            current_mlp = self.output_hypernetworks_mlps[i]
             hyper_in_list += [current_mlp(mask_tokens_out[:, :, i, :])]
-        #hyper_in = torch.stack(hyper_in_list, dim=2)
+        hyper_in = torch.stack(hyper_in_list, dim=2)
 
+        """
         _mean = mean(hyper_in_list[0].squeeze(1))
         _cov = cov(hyper_in_list[0].squeeze(1)).reshape(batch_size, 32, 32)
         Sigma_k = torch.bmm(_cov, _cov.transpose(2, 1))
@@ -969,7 +970,7 @@ def forward(
         for i in range(batch_size):
             dist = MultivariateNormal(_mean[i], Sigma_k[i])
             samples.append(dist.rsample([5]))
-        hyper_in = torch.stack(samples, dim=0).unsqueeze(1)
+        hyper_in = torch.stack(samples, dim=0).unsqueeze(1)"""
 
         _, num_channels, height, width = upscaled_embedding.shape
         upscaled_embedding = upscaled_embedding.reshape(batch_size, point_batch_size, num_channels, height * width)
@@ -1105,6 +1106,54 @@ class Encoder(nn.Module):
     def forward(self, input):
         output = self.layers(input)
         return output
+
+
+from zca import ZCA
+
+class ZcaSam(Model):
+    def __init__(self, config):
+        super().__init__(config)
+        self.sam = SamModel(config)
+
+        self.trf = None # Can only be initialised after the model is loaded
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        input_boxes: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        original_sizes: Optional[torch.Tensor] = None,
+        reshaped_input_sizes: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+
+        if self.trf is None:    
+            X = self.sam.mask_decoder.mask_tokens.weight.detach().cpu().numpy()
+            self.trf = ZCA().fit(X)
+        
+        if image_embeddings is None:
+            image_embeddings = self.sam.get_image_embeddings(pixel_values)
+
+        # Sample from N(0, 1) and apply ZCA whitening to the samples
+        sampled_tokens = torch.tensor(self.trf.inverse_transform(np.random.normal(0, 1, (4, 256)))).to(self.device)
+
+        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=sampled_tokens)
+
+        outputs = self.sam(
+            image_embeddings=image_embeddings,
+            input_boxes=input_boxes,
+            multimask_output=False,
+        )
+
+        loss = nn.BCEWithLogitsLoss()(outputs.pred_masks.reshape(-1), labels[:, 0].reshape(-1).float())
+
+        return SamMultimaskOutput(
+            loss=loss,
+            iou_scores=torch.zeros(outputs.pred_masks.shape[0], dtype=torch.float32, device=outputs.pred_masks.device).unsqueeze(1).unsqueeze(1),
+            pred_masks=outputs.pred_masks.unsqueeze(1),
+        )
+        
 
 
 class AxisAlignedConvGaussian(nn.Module):
