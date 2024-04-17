@@ -16,7 +16,7 @@ from transformers.models.sam.modeling_sam import (
 from typing import Optional, Callable, Union
 
 from src.click import ClickStrategy
-from src.metrics import iou
+from src.metrics import iou, dice
 from src.utils import RegistryMixin
 from src.search import SearchStrategy
 
@@ -159,6 +159,77 @@ class SamBaseline(Model):
             pred_masks=outputs.pred_masks,
         )
 
+
+from scipy.optimize import linear_sum_assignment
+
+class SamAR(Model):
+
+    def __init__(self, config, processor, multimask_output: bool = True):
+        super().__init__(config)
+        self.sam = SamModel(config)
+        self.processor = processor
+        self.seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
+        self.multimask_output = multimask_output
+
+    @property
+    def mask_decoder(self):
+        return self.sam.mask_decoder
+
+    def forward(
+        self, 
+        pixel_values: Optional[torch.Tensor] = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        input_boxes: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        original_sizes: Optional[torch.Tensor] = None,
+        reshaped_input_sizes: Optional[torch.Tensor] = None,
+        label_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        
+        if image_embeddings is None:
+            image_embeddings = self.sam.get_image_embeddings(pixel_values)
+
+        input_masks = None
+        total_loss = 0.0
+        pred_masks = []
+        for i in range(labels.shape[1]):
+            outputs = self.sam(
+                image_embeddings=image_embeddings, 
+                input_boxes=input_boxes,
+                input_masks=input_masks,
+                multimask_output=False,
+            )
+            input_masks = outputs.pred_masks.squeeze(2)
+            pred_masks.append(outputs.pred_masks)
+
+            #loss = self.seg_loss(outputs.pred_masks.squeeze(1).squeeze(1), labels[:, i]).mean(-1).mean(-1)
+            #loss *= label_mask[:, i].float()
+            #total_loss += loss.mean()
+        
+        total_loss = 0.0
+        pred_masks = torch.cat(pred_masks, dim=2)
+        for i in range(labels.shape[0]):
+            losses = torch.zeros(labels.shape[1], labels.shape[1]).to(labels.device)
+            for j in range(labels.shape[1]):
+                for k in range(labels.shape[1]):
+                    loss = self.seg_loss(pred_masks[i, 0, j], labels[i, k]).mean()
+                    losses[j, k] = loss
+            
+            row_ind, col_ind = linear_sum_assignment(losses.detach().cpu().numpy())
+            loss = losses[row_ind, col_ind]
+            loss *= label_mask[i].float()
+            total_loss += loss.sum()
+        
+        total_loss /= labels.shape[1]
+
+        
+            
+        return SamMultimaskOutput(
+            loss=total_loss,
+            iou_scores=outputs.iou_scores,
+            pred_masks=pred_masks,
+        )
 
 
 from torch.distributions.multivariate_normal import MultivariateNormal
@@ -307,7 +378,8 @@ class SLIP(Model):
             fn_mask.reshape(-1),
             fp_mask.reshape(-1),
         ], dim=-1)
-        probs = F.softmax(error_mask, dim=-1)
+        tau = 0.75
+        probs = F.softmax(error_mask / tau, dim=-1)
         idxs = torch.multinomial(probs, 1).cpu().numpy()
         label = [1] if idxs[0] < error_mask.size(0) // 2 else [0]
         clicks = [[idx % W, idx // W] for idx in idxs]
@@ -382,7 +454,7 @@ class SLIP(Model):
         losses, fn_loss, fp_loss = [], 0.0, 0.0
 
         batch_size = image_embeddings.size(0)
-        self.num_mc_samples = 1 if self.training else 25
+        self.num_mc_samples = 1 if self.training else 3
 
         image_embeddings = image_embeddings.repeat_interleave(self.num_mc_samples, dim=0)
         input_boxes = input_boxes.repeat_interleave(self.num_mc_samples, dim=0) if input_boxes is not None else None
@@ -418,6 +490,11 @@ class SLIP(Model):
             fn_pred = policy_outputs.pred_masks[:, 0, 0]
             fp_pred = policy_outputs.pred_masks[:, 0, 1]
 
+            # Normalise the pred_mask to be consistent with false positive and false negative masks
+            #if not self.training:
+            #    pred_masks = pred_masks.masked_fill(fn_pred.unsqueeze(1) > 0.0, -1.0)
+            #    pred_masks = pred_masks.masked_fill(fp_pred.unsqueeze(1) > 0.0, 1.0)
+
             fn_loss += nn.BCEWithLogitsLoss()(fn_pred, fn_masks)
             fp_loss += nn.BCEWithLogitsLoss()(fp_pred, fp_masks)
 
@@ -446,8 +523,8 @@ class SLIP(Model):
         iou_scores = world_outputs.iou_scores.reshape(batch_size, self.num_mc_samples)
 
         if not self.training:
-            pred_masks, idxs, pred_iou = self._clustering(pred_masks, return_idxs=True)
-            iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
+            pred_masks, idxs, _ = self._clustering(pred_masks, return_idxs=True)
+            #iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
 
         
         # Create labels for the blank classifier
@@ -482,7 +559,7 @@ class SLIP(Model):
 
         return SamMultimaskOutput(
             loss=total_loss,
-            iou_scores=iou_scores,
+            iou_scores=torch.zeros(pred_masks.shape[0], dtype=torch.float32, device=pred_masks.device).unsqueeze(1).unsqueeze(1),
             pred_masks=pred_masks,
             input_points=input_points,
             input_labels=input_labels,
@@ -502,11 +579,37 @@ class SLIP(Model):
                 for k in range(shape[2]):
                     similarity_matrix[i, j, k] = self.scorer.score(p_pred[i, j], p_pred[i, k])
         
+        """
+        # Deduplicate the predictions
+        threshold = 0.99
+        batch_new_preds = []
+        batch_indices = []
+        for i in range(shape[0]):
+            new_preds = []
+            indices = []
+            for j in range(shape[1]):
+                if j == 0:
+                    new_preds.append(pred_masks[i, :, j])
+                    indices.append(j)
+                    continue
+                if np.max(similarity_matrix[i, j, :j]) < threshold:
+                    new_preds.append(pred_masks[i, :, j])
+                    indices.append(j)
+            batch_new_preds.append(torch.stack(new_preds, dim=1))
+            batch_indices.append(indices)
+        pred_masks = batch_new_preds
+
+        new_similarity_matrix = []
+        for i, indices in enumerate(batch_indices):
+            new_similarity_matrix.append(similarity_matrix[i, indices][:, indices])
+        similarity_matrix = new_similarity_matrix
+        """
+        
         chosen_preds = []
         all_chosen_idxs = []
-        for i in range(pred_masks.size(0)):
+        for i in range(len(pred_masks)):
             chosen_idxs = self.search_strategy.run_search(scores=similarity_matrix[i], k=self.num_preds)
-            chosen_preds.append(pred_masks[i, :, chosen_idxs])
+            chosen_preds.append(pred_masks[i][:, chosen_idxs])
             all_chosen_idxs.append(chosen_idxs)
         chosen_preds = torch.stack(chosen_preds, dim=0)
         
@@ -516,7 +619,7 @@ class SLIP(Model):
             all_chosen_idxs = torch.tensor(all_chosen_idxs).to(self.device)
 
         if return_idxs:
-            return chosen_preds, all_chosen_idxs, np.mean(similarity_matrix, axis=-1)
+            return chosen_preds, all_chosen_idxs, np.array([np.mean(S, axis=-1) for S in similarity_matrix])
 
         return chosen_preds
 
@@ -1116,6 +1219,7 @@ class ZcaSam(Model):
         self.sam = SamModel(config)
 
         self.trf = None # Can only be initialised after the model is loaded
+        self.num_preds = 3
 
     def forward(
         self,
@@ -1136,22 +1240,30 @@ class ZcaSam(Model):
             image_embeddings = self.sam.get_image_embeddings(pixel_values)
 
         # Sample from N(0, 1) and apply ZCA whitening to the samples
-        sampled_tokens = torch.tensor(self.trf.inverse_transform(np.random.normal(0, 1, (4, 256)))).to(self.device)
+        loss = 0.0
+        pred_masks = []
+        for _ in range(self.num_preds):
+            
+            sampled_tokens = torch.tensor(self.trf.inverse_transform(np.random.normal(0, 1, (4, 256)))).to(self.device)
 
-        self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=sampled_tokens)
+            self.sam.mask_decoder.forward = partial(forward, self=self.sam.mask_decoder, sampled_tokens=sampled_tokens)
 
-        outputs = self.sam(
-            image_embeddings=image_embeddings,
-            input_boxes=input_boxes,
-            multimask_output=False,
-        )
+            outputs = self.sam(
+                image_embeddings=image_embeddings,
+                input_boxes=input_boxes,
+                multimask_output=False,
+            )
 
-        loss = nn.BCEWithLogitsLoss()(outputs.pred_masks.reshape(-1), labels[:, 0].reshape(-1).float())
+            pred_masks.append(outputs.pred_masks)
+
+            loss += nn.BCEWithLogitsLoss()(outputs.pred_masks.reshape(-1), labels[:, 0].reshape(-1).float())
+
+        pred_masks = torch.cat(pred_masks, dim=2)
 
         return SamMultimaskOutput(
             loss=loss,
             iou_scores=torch.zeros(outputs.pred_masks.shape[0], dtype=torch.float32, device=outputs.pred_masks.device).unsqueeze(1).unsqueeze(1),
-            pred_masks=outputs.pred_masks.unsqueeze(1),
+            pred_masks=pred_masks,
         )
         
 

@@ -7,3 +7,5 @@ pillow
 pydicom
 transformers
 gdown
+torch==2.2.1
+accelerate

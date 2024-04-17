@@ -24,7 +24,7 @@ import torch
 from src import constants
 from src.corpora import PreprocessingStrategy
 from src.metrics import compute_metrics
-from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier, ZcaSam
+from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier, ZcaSam, SamAR
 from src.modeling.probabilistic import ProbabilisticSam
 from src.modeling.ssn import SsnSam
 from src.utils import set_seed
@@ -44,6 +44,10 @@ os.environ["WANDB_DISABLED"] = "true"
 MEDSAM = "wanglab/medsam-vit-base"
 SAM = "facebook/sam-vit-base"
 
+SLIP_PATH = "data/lidc_slip"
+MCL_PATH = "data/lidc_mcl"
+
+
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
@@ -62,7 +66,7 @@ class ModelArguments:
     )
 
     model_save_path: str = field(
-        default="data/lidc_slip",
+        default="data/lidc_ar",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -73,8 +77,8 @@ class ModelArguments:
     )
 
     model_type: str = field(
-        default="zca",
-        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier", "zca"]}
+        default="ar",
+        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier", "zca", "ar"]}
     )
 
     learning_rate: float = field(
@@ -100,6 +104,11 @@ class ModelArguments:
     num_simulations: int = field(
         default=10,
         metadata={"help": "Number of simulations for SLIP"}
+    )
+
+    mode: str = field(
+        default="train",
+        metadata={"help": "Mode", "choices": ["train", "eval"]}
     )
 
 
@@ -284,21 +293,29 @@ def _main(args):
             args.model_load_path,
         )
 
+    elif args.model_type == "ar":
+        model = SamAR.from_pretrained(
+            args.model_load_path,
+            processor=processor,
+        )
+
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
 
     dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
     dataset_size = len(dataset)
     indices = list(range(dataset_size))
-    split = int(np.floor(0.2 * dataset_size))
+    split = int(np.floor(0.1 * dataset_size))
     train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
-    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, valid_indices)}
+    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, valid_indices), "test": Subset(dataset, test_indices)}
 
     # Downsample the training set to 1000 samples for debugging
-    dataset["train"] = Subset(dataset["train"], list(range(100)))
+    #dataset["train"] = Subset(dataset["train"], list(range(100)))
 
     # Downsample the test set to 100 samples for debugging
-    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+    #dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+
+    #dataset["test"] = Subset(dataset["test"], list(range(100)))
 
     # Print number of parameters
     print(f"Number of parameters: {model.num_parameters()}")
@@ -311,7 +328,7 @@ def _main(args):
     # Set up trainer
     training_args = TrainingArguments(
         output_dir=args.model_save_path,
-        num_train_epochs=10,
+        num_train_epochs=1,
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         dataloader_drop_last=False,
@@ -319,6 +336,7 @@ def _main(args):
         logging_dir="./logs",
         logging_steps=10,
         evaluation_strategy="epoch",
+        #evaluation_strategy="steps",
         eval_steps=200,
         save_strategy="epoch",
         #fp16=True,
@@ -330,9 +348,14 @@ def _main(args):
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["valid"],
+        eval_dataset=dataset["valid"] if args.mode == "train" else dataset["test"],
         compute_metrics=compute_metrics if args.model_type not in ["theta", "classifier"] else None,
     )
+
+    if args.mode == "eval":
+        results = trainer.evaluate()
+        print(results)
+        exit()
 
     trainer.evaluate()
     trainer.train()
