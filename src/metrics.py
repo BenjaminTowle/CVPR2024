@@ -206,7 +206,6 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
                 non_empty_label.append(lab)
         
         non_empty_labels.append(np.array(non_empty_label))
-    #non_empty_predictions = np.array(non_empty_predictions)
     non_empty_labels = np.array(non_empty_labels)
 
     #predictions = non_empty_predictions
@@ -221,7 +220,7 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
         "dice": compute_dice(predictions, labels),
         "dice_max": compute_dice_max(predictions, labels),
         "dice_nod": compute_dice_nod(predictions, labels),
-        "collective_insight": collective_insight(predictions, labels),
+        "collective_insight": collective_insight(predictions, labels) if predictions.shape[1] != 1 else 0.0,
         "ged": ged,
         "sample_diversity": diversity,
         "label_diversity": label_diversity,

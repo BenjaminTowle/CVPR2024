@@ -1,239 +1,22 @@
-import cv2
+import gdown
+import nibabel as nib
 import numpy as np
 import os
-import re
+import pickle
+import random
 import torch
-
-from abc import ABC, abstractmethod
-from datasets import Dataset, DatasetDict, concatenate_datasets
-from itertools import chain
+import torch.nn.functional as F
+from datasets import Dataset
 from os.path import join
 from PIL import Image
-from transformers import SamProcessor
-from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import Subset
 
-from src.utils import RegistryMixin
+if not os.path.exists("data"):
+    os.makedirs("data")
+if not os.path.exists("data/data_lidc.pickle"):
+    file_id = "1QAtsh6qUgopFx1LJs20gOO9v5NP6eBgI"
+    gdown.download(f"https://drive.google.com/uc?id={file_id}", "data/data_lidc.pickle", quiet=False)
 
-
-class PreprocessingStrategy(ABC, RegistryMixin):
-
-    file_reader = "default"
-
-    @staticmethod
-    def train_valid_test_split(dataset, valid_size, test_size) -> dict:
-        """Split the dataset into train, valid, and test subsets.
-        """
-        dataset = dataset.train_test_split(test_size=test_size)
-        train_valid = dataset["train"].train_test_split(test_size=valid_size)
-        dataset["train"] = train_valid["train"]
-        dataset["valid"] = train_valid["test"]
-        return dataset
-
-    @abstractmethod
-    def preprocess(self, processor: SamProcessor, valid_size: float = 0.1, test_size: float = 0.1, **kwargs):
-        """Preprocess the dataset using the given processor.
-        """
-        pass
-
-
-@PreprocessingStrategy.register_subclass("lidc")
-class LidcPreprocessingStrategy(PreprocessingStrategy):
-
-    n_annotations = 4
-    dataset_path = "data/lidc"
-
-    def _create_dataset(
-        self, split="training"
-    ):
-
-        images = []
-        labels = []
-        for folder in os.listdir(os.path.join(self.dataset_path, split)):
-            for file in os.listdir(os.path.join(self.dataset_path, split, folder)):
-                if "label" in file:
-                    labels.append(os.path.join(self.dataset_path, split, folder, file))
-                    continue
-                
-                for _ in range(self.n_annotations):
-                    images.append(os.path.join(self.dataset_path, split, folder, file))
-        
-        dataset = Dataset.from_dict({"image": images, "label": labels})
-        return dataset
-
-    def preprocess(
-        self, 
-        processor: SamProcessor, 
-        valid_size: float = 0.1, 
-        test_size: float = 0.1, 
-        **kwargs
-    ):
-
-        dataset = DatasetDict({
-            "train": self._create_dataset("training"),
-            "valid": self._create_dataset("testing"),
-            "test": self._create_dataset("testing")
-        })
-
-        for key in dataset.keys():
-            dataset[key] = PathDataset(dataset[key], processor, self.dataset_path, use_bounding_box=False)
-        return dataset
-        
-
-
-@PreprocessingStrategy.register_subclass("busi")
-class BUSIPreprocessingStrategy(PreprocessingStrategy):
-
-    def preprocess(
-        self, 
-        processor: SamProcessor, 
-        valid_size: float = 0.1, 
-        test_size: float = 0.1, 
-        kd: bool = False,
-        use_bounding_box: bool = True,
-        do_split: bool = True,
-    ):
-        dataset_path = "data/Dataset_BUSI_with_GT"
-        paths = {}  # dictionary matching ids to image path and label path key-value pairs
-        for file in chain(os.listdir(os.path.join(dataset_path, "benign")), os.listdir(os.path.join(dataset_path, "malignant"))):
-            # Each file string contains a number, use re to extract this
-            idx = re.search(r"\d+", file).group(0)
-            if idx not in paths:
-                paths[idx] = {}
-            if "mask" in file and ".png" in file:
-                paths[idx]["label"] = file
-            elif ".png" in file:
-                paths[idx]["image"] = file
-        image = []
-        label = []
-        for idx, path in paths.items():
-            if "benign" in path["image"]:
-                p = os.path.join(dataset_path, "benign")
-            else:
-                p = os.path.join(dataset_path, "malignant")
-            image.append(os.path.join(p, path["image"]))
-            label.append(os.path.join(p, path["label"]))
-
-        assert len(image) == len(label), "Number of images and labels do not match."
-        
-        dataset = Dataset.from_dict({"image": image, "label": label})
-
-        dataset_cls = PathDataset if not kd else PathDataset
-
-        if do_split:
-            dataset = self.train_valid_test_split(dataset, valid_size, test_size)
-            for key in dataset.keys():
-                dataset[key] = dataset_cls(dataset[key], processor, dataset_path, use_bounding_box=use_bounding_box)
-        else:
-            dataset = dataset_cls(dataset, processor, dataset_path, use_bounding_box=use_bounding_box)
-        return dataset
-
-
-@PreprocessingStrategy.register_subclass("cvc")
-class CVCPreprocessingStrategy(PreprocessingStrategy):
-
-    file_reader = "tif"
-
-    def preprocess(
-        self, 
-        processor: SamProcessor, 
-        valid_size: float = 0.1, 
-        test_size: float = 0.1, 
-        use_bounding_box: bool = True,
-        do_split: bool = True,
-        **kwargs
-    ):
-        dataset_path = "data/CVC-ClinicDB"
-        paths = {}
-        for file in os.listdir(os.path.join(dataset_path, "Original")):
-            paths[file] = {"image": os.path.join(dataset_path, "Original", file)}
-        for file in os.listdir(os.path.join(dataset_path, "Ground Truth")):
-            paths[file]["label"] = os.path.join(dataset_path, "Ground Truth", file)
-        image = []
-        label = []
-        for path in paths.values():
-            image.append(path["image"])
-            label.append(path["label"])
-        dataset = Dataset.from_dict({"image": image, "label": label})
-
-        if do_split:
-            dataset = self.train_valid_test_split(dataset, valid_size, test_size)
-            for key in dataset.keys():
-                dataset[key] = PathDataset(dataset[key], processor, dataset_path, file_reader=self.file_reader, use_bounding_box=use_bounding_box)
-        else:
-            dataset = PathDataset(dataset, processor, dataset_path, file_reader=self.file_reader, use_bounding_box=use_bounding_box)
-        
-
-        return dataset
-
-
-@PreprocessingStrategy.register_subclass("isic")
-class ISICPreprocessingStrategy(PreprocessingStrategy):
-
-    def preprocess(
-        self, 
-        processor: SamProcessor, 
-        valid_size: float = 0.1, 
-        test_size: float = 0.1, 
-        kd=False, 
-        use_bounding_box: bool = True,
-        do_split: bool = True,
-        **kwargs
-    ):
-        dataset_path = "data/ISIC2016"
-        train_paths = {}
-        test_paths = {}
-        for folder in os.listdir(dataset_path):
-            for file in os.listdir(os.path.join(dataset_path, folder)):
-                idx = re.search(r"\d+", file).group(0)
-
-                if idx not in train_paths and "Training" in folder:
-                    train_paths[idx] = {}
-                if idx not in test_paths and "Test" in folder:
-                    test_paths[idx] = {}
-
-                if folder.endswith("Test_Data"):
-                    test_paths[idx]["image"] = join(dataset_path, folder, file)
-                elif folder.endswith("Test_GroundTruth"):
-                    test_paths[idx]["label"] = join(dataset_path, folder, file)
-                elif folder.endswith("Training_Data"):
-                    train_paths[idx]["image"] = join(dataset_path, folder, file)
-                elif folder.endswith("Training_GroundTruth"):
-                    train_paths[idx]["label"] = join(dataset_path, folder, file)
-                else:
-                    raise ValueError("Unknown folder name.")
-                
-        train_image = []
-        train_label = []
-        for idx, path in train_paths.items():
-            train_image.append(path["image"])
-            train_label.append(path["label"])
-        
-        test_image = []
-        test_label = []
-        for idx, path in test_paths.items():
-            test_image.append(path["image"])
-            test_label.append(path["label"])
-
-        dataset = Dataset.from_dict({"image": train_image, "label": train_label})
-        train_valid_dataset = dataset.train_test_split(test_size=valid_size)
-        test_dataset = Dataset.from_dict({"image": test_image, "label": test_label})
-        
-        dataset = DatasetDict({
-            "train": train_valid_dataset["train"],
-            "valid": train_valid_dataset["test"],
-            "test": test_dataset
-        })
-
-        dataset_cls = PathDataset
-
-        if do_split:
-            for key in dataset.keys():
-                dataset[key] = dataset_cls(dataset[key], processor, dataset_path, use_bounding_box=use_bounding_box)
-        else:
-            dataset = concatenate_datasets([dataset["train"], dataset["valid"], dataset["test"]])
-            dataset = dataset_cls(dataset, processor, dataset_path, use_bounding_box=use_bounding_box)
-
-        return dataset
 
 
 def get_bounding_box(ground_truth_map, add_perturbation=False):
@@ -256,94 +39,261 @@ def get_bounding_box(ground_truth_map, add_perturbation=False):
     return bbox
 
 
-class FileReader(ABC, RegistryMixin):
+class QUBIQ(Dataset):
 
-    @abstractmethod
-    def __call__(self, path: str):
-        pass
+    file_reader = "nii.gz"
 
-
-@FileReader.register_subclass("tif")
-class TIFFileReader(FileReader):
-    
-    def __call__(self, path: str):
-        image = cv2.imread(path)
-        image = cv2.resize(image, (256, 256)) 
-        return image
-
-
-@FileReader.register_subclass("default")
-class DefaultFileReader(FileReader):
-
-    def __call__(self, path: str):
-        image = np.array(Image.open(path).convert("RGB").resize((256, 256)))
-        return image
-
-
-class PathDataset(TorchDataset):
-    """
-    A Dataset where the image and label are paths to the image and label respectively.
-    """
-    def __init__(
-        self, 
-        dataset, 
-        processor, 
-        dataset_path: str, 
-        file_reader: str = "default", 
-        use_bounding_box: bool = True
-    ):
-        
-        self.dataset = dataset
+    def __init__(self, processor, split="train", use_bounding_box=True) -> None:
+        self.i = 0
         self.processor = processor
-        self.dataset_path = dataset_path
-        self.file_reader = FileReader.create(file_reader)()
+        self.images, self.labels = self.preprocess(split)
         self.use_bounding_box = use_bounding_box
 
-    def __len__(self):
-        return len(self.dataset)
+    def read_file(self, path: str):
+        image = nib.load(path).get_fdata()
 
-    def preprocess(self, item):
-        # Check file type
-        image = self.file_reader(item["image"])
-        if type(item["label"]) == list:
-            ground_truth_mask = [self.file_reader(l) for l in item["label"]]
-        else:
-            ground_truth_mask = self.file_reader(item["label"])
-
-        # Convert ground_truth_mask to binary
-        prompt = None
-        if type(ground_truth_mask) == list:
-            prompt = [[get_bounding_box(np.max(ground_truth_mask[0] > 0, axis=-1))]]
-            ground_truth_mask = [(np.max(M, axis=-1) > 0) for M in ground_truth_mask]
-        elif ground_truth_mask.ndim == 3:
-            ground_truth_mask = (ground_truth_mask > 0).max(axis=-1)
-
-        # get bounding box prompt
-        if prompt is None:
-            prompt = [[get_bounding_box(ground_truth_mask)]]
-
-        # Remove bounding box if not using it
-        if not self.use_bounding_box:
-            prompt = None
+        image += np.abs(image.min())
+        image = (256 * (image / image.max())).astype(np.uint8)
+        image = np.array(Image.fromarray(image).resize((256, 256)))
         
-        # prepare image and prompt for the model
-        inputs = self.processor(image, input_boxes=prompt, return_tensors="pt")
+        return image
+    
+    def read_label(self, path: str):
+        label = nib.load(path).get_fdata()
+        label = np.array(Image.fromarray(label).resize((256, 256)))
+        label = label > 0
+        return label
 
-        # remove batch dimension which the processor adds by default
-        inputs = {k:v.squeeze(0) for k,v in inputs.items()}
-        inputs["labels"] = torch.tensor(np.array(ground_truth_mask).astype(bool)).to(inputs["pixel_values"].device)
-        inputs["prompt"] = prompt
+    def dfs(self, paths: list, path: str):
+        for item in os.listdir(path):
+            new_path = join(path, item)
+            if "kidney" not in new_path:
+                continue
 
-        inputs["image"] = image
+            if item.startswith("case"):
+                paths.append(new_path)
+            elif os.path.isdir(new_path):
+                self.dfs(paths, new_path)
+            else:
+                continue
+        return paths
 
-        if "input_points" in item:
-            inputs["input_points"] = torch.tensor(item["input_points"]).to(inputs["pixel_values"].device)
-            inputs["input_labels"] = torch.tensor(item["input_labels"]).to(inputs["pixel_values"].device)
+    def get_images_labels(self, path: str, single_label: bool = False) -> dict:
+        image = []
+        label = []
+        cases = self.dfs([], path)
+
+        for case in cases:
+            label_set = []
+            for file in os.listdir(case):
+                if not file.endswith(self.file_reader):
+                    continue
+                if file.startswith("image"):
+                    image.append(join(case, file))
+                else:
+                    label_set.append(join(case, file))
+
+            if single_label:
+                label.append(label_set[self.i % len(label_set)])
+                self.i += 1
+            else:
+                label.append(label_set)
+        
+        return {
+            "image": image,
+            "label": label
+        }
+
+    def preprocess(self, split="train"):
+        dataset_path = "data/qubiq"
+
+        if split == "train":
+            path = join(dataset_path, "training_data_v2")
+
+        else:
+            path = join(dataset_path, "validation_data_v2")
+            
+        dict = self.get_images_labels(path)
+
+        images = [self.read_file(img) for img in dict["image"]]
+        labels = [[self.read_label(l) for l in lbl] for lbl in dict["label"]]
+            
+        return images, labels
+        
+    def __getitem__(self, indices):
+        bsz = len(indices)
+        image = np.stack([self.images[index] for index in indices], axis=0)
+        label = np.stack([
+            self.labels[index] for index in indices]).astype(float)
+        
+        # Prepare image and prompt for the model
+        if self.processor is not None:
+            image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
+            input_boxes = None
+            if self.use_bounding_box:
+                input_boxes = []
+                for l in label:
+                    while True:
+                        idx = random.randint(0, len(l)-1)
+                        if l[idx].sum() > 0:
+                            break
+                    input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
+            
+            inputs = self.processor(image, input_boxes=input_boxes, do_rescale=True, return_tensors="pt")
+
+            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
+            
+            inputs["labels"] = F.interpolate(
+                torch.tensor(label), 
+                size=(256, 256), 
+                mode="nearest"
+            ).bool().squeeze(1)
+
+            # Create a mask for labels that are blank
+            inputs["label_mask"] = torch.sum(inputs["labels"], dim=(-1, -2)) > 0
 
         return inputs
 
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        inputs = self.preprocess(item)
+    def __len__(self):
+        return len(self.images)
+        
 
+
+
+class LIDC_IDRI(Dataset):
+    images = []
+    labels = []
+    series_uid = []
+
+    def __init__(
+        self, 
+        dataset_location, 
+        processor=None, 
+        transform=None, 
+        use_bounding_box=True, 
+        multilabel=True
+    ):
+        self.transform = transform
+        self.processor = processor
+        self.use_bounding_box = use_bounding_box
+        self.multilabel = multilabel
+
+        self.model = None
+        
+        max_bytes = 2**31 - 1
+        data = {}
+        for file in os.listdir(dataset_location):
+            filename = os.fsdecode(file)
+            if '.pickle' in filename:
+                print("Loading file", filename)
+                file_path = dataset_location + filename
+                bytes_in = bytearray(0)
+                input_size = os.path.getsize(file_path)
+                with open(file_path, 'rb') as f_in:
+                    for _ in range(0, input_size, max_bytes):
+                        bytes_in += f_in.read(max_bytes)
+                new_data = pickle.loads(bytes_in)
+                data.update(new_data)
+        
+        for i, (key, value) in enumerate(data.items()):
+            self.images.append(value['image'].astype(float))
+            self.labels.append(value['masks'])
+            self.series_uid.append(value['series_uid'])
+
+
+        assert (len(self.images) == len(self.labels) == len(self.series_uid))
+
+        for img in self.images:
+            assert np.max(img) <= 1 and np.min(img) >= 0
+        for label in self.labels:
+            assert np.max(label) <= 1 and np.min(label) >= 0
+
+        del new_data
+        del data
+
+        self.num_labels = 4
+
+    def __getitem__(self, indices):
+        if type(indices) == int:
+            index = indices
+            image = np.expand_dims(self.images[index], axis=0)
+            label = self.labels[index][random.randint(0, self.num_labels-1)].astype(float)
+
+            image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
+            inputs = self.processor(image, do_rescale=False, return_tensors="pt")
+            # remove batch dimension which the processor adds by default
+            inputs = {k:v.squeeze(0) for k,v in inputs.items()}
+            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+
+            inputs["labels"] = F.interpolate(
+                torch.tensor(label).unsqueeze(0).unsqueeze(0),  
+                size=(256, 256), 
+                mode="nearest"
+            ).bool().squeeze()
+        else:
+            bsz = len(indices)
+            image = np.stack([self.images[index] for index in indices], axis=0)
+            label = np.stack([
+                self.labels[index] for index in indices]).astype(float)
+            
+            # Prepare image and prompt for the model
+            if self.processor is not None:
+                image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
+                input_boxes = None
+                if self.use_bounding_box:
+                    input_boxes = []
+                    for l in label:
+                        while True:
+                            idx = random.randint(0, 3)
+                            if l[idx].sum() > 0:
+                                break
+                        input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
+                
+                inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
+
+                inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
+                
+                inputs["labels"] = F.interpolate(
+                    torch.tensor(label), 
+                    size=(256, 256), 
+                    mode="nearest"
+                ).bool().squeeze(1)
+
+                # Create a mask for labels that are blank
+                inputs["label_mask"] = torch.sum(inputs["labels"], dim=(-1, -2)) > 0
+
+
+            else:
+                inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
+        
         return inputs
+
+    def __len__(self):
+        return len(self.images)
+
+
+def get_dataset_dict(dataset_name, processor, args):
+    if dataset_name == "lidc":
+        dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
+        dataset_size = len(dataset)
+        indices = list(range(dataset_size))
+        split = int(np.floor(0.1 * dataset_size))
+        train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
+        dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, valid_indices), "test": Subset(dataset, test_indices)}
+        
+        return dataset
+    
+    elif dataset_name == "qubiq":
+        train = QUBIQ(processor, split="train", use_bounding_box=args.use_bounding_box)
+        dataset_size = len(train)
+        indices = list(range(dataset_size))
+        train = Subset(train, indices)
+
+        valid = QUBIQ(processor, split="valid", use_bounding_box=args.use_bounding_box)
+        dataset_size = len(valid)
+        indices = list(range(dataset_size))
+        valid = Subset(valid, indices)
+        return {"train": train, "valid": valid}
+    
+    else:
+        raise ValueError(f"Dataset {dataset_name} not found.")

@@ -1,12 +1,9 @@
 import sys
 import os
-import gdown
-import random
 sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
 from datasets import set_caching_enabled    
 from dataclasses import dataclass, field
-import torch.nn.functional as F
 from torch.utils.data import Subset
 from transformers import (
     HfArgumentParser, 
@@ -14,26 +11,16 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from functools import partial
 from transformers.utils import logging
-from datasets import Dataset
-import numpy as np
 import os
-import pickle
 import torch
 
-from src import constants
-from src.corpora import PreprocessingStrategy
+from src.corpora import get_dataset_dict
 from src.metrics import compute_metrics
-from src.modeling2 import SamBaseline, SLIP, SamThetaForTraining, UNet, StochasticSam, BlankClassifier, ZcaSam, SamAR
-from src.modeling.probabilistic import ProbabilisticSam
-from src.modeling.ssn import SsnSam
+from src.modeling2 import SamBaseline, SamAR
 from src.utils import set_seed
 
-if not os.path.exists("data"):
-    os.makedirs("data")
-if not os.path.exists("data/data_lidc.pickle"):
-    file_id = "1QAtsh6qUgopFx1LJs20gOO9v5NP6eBgI"
-    gdown.download(f"https://drive.google.com/uc?id={file_id}", "data/data_lidc.pickle", quiet=False)
 
 set_seed()
 logger = logging.get_logger()
@@ -46,13 +33,20 @@ SAM = "facebook/sam-vit-base"
 
 SLIP_PATH = "data/lidc_slip"
 MCL_PATH = "data/lidc_mcl"
+AR_PATH = "data/lidc_ar_unet"
+AR_LONG_PATH = "data/lidc_ar_long"
 
 
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default=SAM,
+        default="data/lidc_ar_sg",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
+    )
+
+    results_write_path: str = field(
+        default="data/results_sg.json",
+        metadata={"help": "Path to save results"}
     )
 
     processor_load_path: str = field(
@@ -66,19 +60,24 @@ class ModelArguments:
     )
 
     model_save_path: str = field(
-        default="data/lidc_ar",
+        default="data/lidc_ar_sg",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
     dataset: str = field(
         default="lidc",
         metadata={"help": "Path to the dataset or dataset identifier from huggingface.co/datasets",
-                    "choices": ["busi", "cvc", "isic", "lidc"]}
+                    "choices": ["lidc", "qubiq"]}
     )
 
     model_type: str = field(
         default="ar",
-        metadata={"help": "Model type", "choices": ["slip", "baseline", "theta", "unet", "stochastic", "classifier", "zca", "ar"]}
+        metadata={"help": "Model type", "choices": ["mcl", "det", "ar"]}
+    )
+
+    ablation: str = field(
+        default="sg",
+        metadata={"help": "Ablation study", "choices": ["none", "random", "sequential", "no_ha", "sg"]}
     )
 
     learning_rate: float = field(
@@ -101,148 +100,16 @@ class ModelArguments:
         metadata={"help": "Whether to use bounding boxes"}
     )
 
-    num_simulations: int = field(
-        default=10,
+    num_samples: int = field(
+        default=3,
         metadata={"help": "Number of simulations for SLIP"}
     )
 
     mode: str = field(
-        default="train",
+        default="eval",
         metadata={"help": "Mode", "choices": ["train", "eval"]}
     )
 
-
-def get_bounding_box(ground_truth_map, add_perturbation=False):
-    # get bounding box from mask
-    y_indices, x_indices = np.where(ground_truth_map > 0)
-    if len(x_indices) == 0 or len(y_indices) == 0:
-        # Return default value
-        return [0, 0, ground_truth_map.shape[1], ground_truth_map.shape[0]]
-    x_min, x_max = np.min(x_indices), np.max(x_indices)
-    y_min, y_max = np.min(y_indices), np.max(y_indices)
-    # add perturbation to bounding box coordinates
-    if add_perturbation:
-        H, W = ground_truth_map.shape
-        x_min = max(0, x_min - np.random.randint(0, 20))
-        x_max = min(W, x_max + np.random.randint(0, 20))
-        y_min = max(0, y_min - np.random.randint(0, 20))
-        y_max = min(H, y_max + np.random.randint(0, 20))
-    bbox = [x_min, y_min, x_max, y_max]
-
-    return bbox
-
-
-class LIDC_IDRI(Dataset):
-    images = []
-    labels = []
-    series_uid = []
-
-    def __init__(
-        self, 
-        dataset_location, 
-        processor=None, 
-        transform=None, 
-        use_bounding_box=True, 
-        multilabel=True
-    ):
-        self.transform = transform
-        self.processor = processor
-        self.use_bounding_box = use_bounding_box
-        self.multilabel = multilabel
-
-        self.model = None
-        
-        max_bytes = 2**31 - 1
-        data = {}
-        for file in os.listdir(dataset_location):
-            filename = os.fsdecode(file)
-            if '.pickle' in filename:
-                print("Loading file", filename)
-                file_path = dataset_location + filename
-                bytes_in = bytearray(0)
-                input_size = os.path.getsize(file_path)
-                with open(file_path, 'rb') as f_in:
-                    for _ in range(0, input_size, max_bytes):
-                        bytes_in += f_in.read(max_bytes)
-                new_data = pickle.loads(bytes_in)
-                data.update(new_data)
-        
-        for i, (key, value) in enumerate(data.items()):
-            self.images.append(value['image'].astype(float))
-            self.labels.append(value['masks'])
-            self.series_uid.append(value['series_uid'])
-
-
-        assert (len(self.images) == len(self.labels) == len(self.series_uid))
-
-        for img in self.images:
-            assert np.max(img) <= 1 and np.min(img) >= 0
-        for label in self.labels:
-            assert np.max(label) <= 1 and np.min(label) >= 0
-
-        del new_data
-        del data
-
-        self.num_labels = 4
-
-    def __getitem__(self, indices):
-        if type(indices) == int:
-            index = indices
-            image = np.expand_dims(self.images[index], axis=0)
-            label = self.labels[index][random.randint(0, self.num_labels-1)].astype(float)
-
-            image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
-            inputs = self.processor(image, do_rescale=False, return_tensors="pt")
-            # remove batch dimension which the processor adds by default
-            inputs = {k:v.squeeze(0) for k,v in inputs.items()}
-            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
-
-            inputs["labels"] = F.interpolate(
-                torch.tensor(label).unsqueeze(0).unsqueeze(0),  
-                size=(256, 256), 
-                mode="nearest"
-            ).bool().squeeze()
-        else:
-            bsz = len(indices)
-            image = np.stack([self.images[index] for index in indices], axis=0)
-            label = np.stack([
-                self.labels[index] for index in indices]).astype(float)
-            
-            # Prepare image and prompt for the model
-            if self.processor is not None:
-                image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
-                input_boxes = None
-                if self.use_bounding_box:
-                    input_boxes = []
-                    for l in label:
-                        while True:
-                            idx = random.randint(0, 3)
-                            if l[idx].sum() > 0:
-                                break
-                        input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
-                
-                #input_boxes = [[get_bounding_box(l[random.randint(0, 3)], add_perturbation=True)] for l in label] if self.use_bounding_box else None
-                inputs = self.processor(image, input_boxes=input_boxes, do_rescale=False, return_tensors="pt")
-
-                inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
-                
-                inputs["labels"] = F.interpolate(
-                    torch.tensor(label), 
-                    size=(256, 256), 
-                    mode="nearest"
-                ).bool().squeeze(1)
-
-                # Create a mask for labels that are blank
-                inputs["label_mask"] = torch.sum(inputs["labels"], dim=(-1, -2)) > 0
-
-
-            else:
-                inputs = {"labels": torch.tensor(label), "pixel_values": torch.from_numpy(image).float()}
-        
-        return inputs
-
-    def __len__(self):
-        return len(self.images)
 
 
 def _main(args):
@@ -250,70 +117,38 @@ def _main(args):
     processor = SamProcessor.from_pretrained(args.processor_load_path) if args.model_type != "unet" else None
 
     # Load model
-    if args.model_type == "slip":
-        model = SLIP.from_pretrained(
-            args.model_load_path, 
-            processor,
-            num_simulations=args.num_simulations,
-            cache_dir=constants.CACHE_DIR,
-            multiple_annotations=False
+    if args.model_type == "det":
+        model = SamBaseline.from_pretrained(
+            args.model_load_path,
+            processor=processor,
+            multimask_output=False
         )
 
-    elif args.model_type == "baseline":
+    elif args.model_type == "mcl":
         model = SamBaseline.from_pretrained(
             args.model_load_path,
             processor=processor,
             multimask_output=True
         )
 
-    elif args.model_type == "theta":
-        model = SamThetaForTraining.from_pretrained(args.model_load_path)
-        env = SLIP.from_pretrained(
-            args.teacher_load_path,
-            processor
-        )
-        model.set_env(env)
-
-    elif args.model_type == "stochastic":
-        model = SsnSam.from_pretrained(
-            args.model_load_path,
-            processor=processor,
-        )
-
-    elif args.model_type == "unet":
-        model = UNet()
-
-    elif args.model_type == "classifier":
-        model = BlankClassifier.from_pretrained(
-            args.model_load_path,
-        )
-
-    elif args.model_type == "zca":
-        model = ZcaSam.from_pretrained(
-            args.model_load_path,
-        )
-
     elif args.model_type == "ar":
         model = SamAR.from_pretrained(
             args.model_load_path,
             processor=processor,
+            num_samples=args.num_samples,
+            ablation=args.ablation
         )
 
     else:
         raise ValueError(f"Model type {args.model_type} not supported")
 
-    dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
-    dataset_size = len(dataset)
-    indices = list(range(dataset_size))
-    split = int(np.floor(0.1 * dataset_size))
-    train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
-    dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, valid_indices), "test": Subset(dataset, test_indices)}
-
+    
+    dataset = get_dataset_dict(args.dataset, processor, args)
     # Downsample the training set to 1000 samples for debugging
     #dataset["train"] = Subset(dataset["train"], list(range(100)))
 
     # Downsample the test set to 100 samples for debugging
-    #dataset["valid"] = Subset(dataset["valid"], list(range(100)))
+    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
 
     #dataset["test"] = Subset(dataset["test"], list(range(100)))
 
@@ -322,7 +157,7 @@ def _main(args):
  
     # Make sure we only compute gradients for mask decoder
     for name, param in model.named_parameters():
-        if name.startswith("sam.vision_encoder"): # or name.startswith("sam.prompt_encoder"):
+        if name.startswith("sam.vision_encoder"):
             param.requires_grad_(False)
     
     # Set up trainer
@@ -335,8 +170,8 @@ def _main(args):
         weight_decay=0.01,
         logging_dir="./logs",
         logging_steps=10,
-        evaluation_strategy="epoch",
-        #evaluation_strategy="steps",
+        #evaluation_strategy="epoch",
+        evaluation_strategy="steps",
         eval_steps=200,
         save_strategy="epoch",
         #fp16=True,
@@ -344,12 +179,14 @@ def _main(args):
         learning_rate=args.learning_rate,
     )
 
+    _compute_metrics = partial(compute_metrics, write_path=args.results_write_path)
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["valid"] if args.mode == "train" else dataset["test"],
-        compute_metrics=compute_metrics if args.model_type not in ["theta", "classifier"] else None,
+        compute_metrics=_compute_metrics,
     )
 
     if args.mode == "eval":
