@@ -1,8 +1,9 @@
+import hydra
 import sys
 import os
 sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
-from datasets import set_caching_enabled    
+from datasets import disable_caching    
 from dataclasses import dataclass, field
 from torch.utils.data import Subset
 from transformers import (
@@ -14,18 +15,16 @@ from transformers import (
 from functools import partial
 from transformers.utils import logging
 import os
-import torch
 
 from src.corpora import get_dataset_dict
 from src.metrics import compute_metrics
-from src.modeling2 import SamBaseline, SamAR
+from src.modeling import SamBaseline, SeqSam
 from src.utils import set_seed
 
 
-set_seed()
 logger = logging.get_logger()
 logging.set_verbosity_info()
-set_caching_enabled(False)
+disable_caching()
 os.environ["WANDB_DISABLED"] = "true"
 
 MEDSAM = "wanglab/medsam-vit-base"
@@ -40,7 +39,7 @@ AR_LONG_PATH = "data/lidc_ar_long"
 @dataclass
 class ModelArguments:
     model_load_path: str = field(
-        default="data/lidc_ar_sg",
+        default=SAM,
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
@@ -54,29 +53,24 @@ class ModelArguments:
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
-    teacher_load_path: str = field(
-        default="facebook/sam-vit-base",
-        metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
-    )
-
     model_save_path: str = field(
-        default="data/lidc_ar_sg",
+        default="data/dummy",
         metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
     )
 
     dataset: str = field(
-        default="lidc",
+        default="qubiq",
         metadata={"help": "Path to the dataset or dataset identifier from huggingface.co/datasets",
                     "choices": ["lidc", "qubiq"]}
     )
 
     model_type: str = field(
         default="ar",
-        metadata={"help": "Model type", "choices": ["mcl", "det", "ar"]}
+        metadata={"help": "Model type", "choices": ["mcl", "det", "seqsam"]}
     )
 
     ablation: str = field(
-        default="sg",
+        default="none",
         metadata={"help": "Ablation study", "choices": ["none", "random", "sequential", "no_ha", "sg"]}
     )
 
@@ -111,49 +105,46 @@ class ModelArguments:
     )
 
 
-
-def _main(args):
+def _main(cfg):
     # Load dataset
-    processor = SamProcessor.from_pretrained(args.processor_load_path) if args.model_type != "unet" else None
+    processor = SamProcessor.from_pretrained(cfg.model.load_path)
 
     # Load model
-    if args.model_type == "det":
+    if cfg.model.type == "det":
         model = SamBaseline.from_pretrained(
-            args.model_load_path,
-            processor=processor,
+            cfg.model.load_path,
             multimask_output=False
         )
 
-    elif args.model_type == "mcl":
+    elif cfg.model.type == "mcl":
         model = SamBaseline.from_pretrained(
-            args.model_load_path,
-            processor=processor,
+            cfg.model.load_path,
             multimask_output=True
         )
 
-    elif args.model_type == "ar":
-        model = SamAR.from_pretrained(
-            args.model_load_path,
-            processor=processor,
-            num_samples=args.num_samples,
-            ablation=args.ablation
+    elif cfg.model.type == "seqsam":
+        model = SeqSam.from_pretrained(
+            cfg.model.load_path,
+            num_samples=cfg.model.num_samples,
+            ablation=cfg.model.ablation
         )
 
     else:
-        raise ValueError(f"Model type {args.model_type} not supported")
+        raise ValueError(f"Model type {cfg.model.type} not supported")
 
+    dataset = get_dataset_dict(cfg.data.dataset, processor, cfg.mode)
     
-    dataset = get_dataset_dict(args.dataset, processor, args)
     # Downsample the training set to 1000 samples for debugging
-    #dataset["train"] = Subset(dataset["train"], list(range(100)))
-
-    # Downsample the test set to 100 samples for debugging
-    dataset["valid"] = Subset(dataset["valid"], list(range(100)))
-
-    #dataset["test"] = Subset(dataset["test"], list(range(100)))
+    def _filter(dataset):
+        num_samples = min(len(dataset), 100)
+        return Subset(dataset, list(range(num_samples)))
+    
+    if cfg.debug:
+        dataset["train"] = _filter(dataset["train"])
+        dataset["eval"] = _filter(dataset["eval"])
 
     # Print number of parameters
-    print(f"Number of parameters: {model.num_parameters()}")
+    logger.info(f"Number of parameters: {model.num_parameters()}")
  
     # Make sure we only compute gradients for mask decoder
     for name, param in model.named_parameters():
@@ -162,10 +153,10 @@ def _main(args):
     
     # Set up trainer
     training_args = TrainingArguments(
-        output_dir=args.model_save_path,
-        num_train_epochs=1,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
+        output_dir=cfg.model.save_path,
+        num_train_epochs=cfg.params.num_train_epochs,
+        per_device_train_batch_size=cfg.params.batch_size,
+        per_device_eval_batch_size=cfg.params.batch_size,
         dataloader_drop_last=False,
         weight_decay=0.01,
         logging_dir="./logs",
@@ -174,42 +165,40 @@ def _main(args):
         evaluation_strategy="steps",
         eval_steps=200,
         save_strategy="epoch",
-        #fp16=True,
-        #save_total_limit=1,
-        learning_rate=args.learning_rate,
+        save_total_limit=1,
+        learning_rate=cfg.params.learning_rate,
     )
 
-    _compute_metrics = partial(compute_metrics, write_path=args.results_write_path)
+    r_path = "_".join(
+        [cfg.model.type, cfg.model.ablation, cfg.data.dataset]) + ".jsonl"
+    _compute_metrics = partial(
+        compute_metrics, write_path=os.path.join(cfg.data.path, r_path)
+    )
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["valid"] if args.mode == "train" else dataset["test"],
+        eval_dataset=dataset["eval"],
         compute_metrics=_compute_metrics,
     )
 
-    if args.mode == "eval":
+    if cfg.mode == "eval":
         results = trainer.evaluate()
-        print(results)
+        logger.info(results)
         exit()
 
     trainer.evaluate()
     trainer.train()
 
-    if args.model_type == "theta":
-        model.env = None
-
-    if args.model_type == "unet":
-        torch.save(model.state_dict(), args.model_save_path)
-    else:
-        model.save_pretrained(args.model_save_path)
+    model.save_pretrained(cfg.model.save_path)
+    processor.save_pretrained(cfg.model.save_path)
 
 
-def main():
-    parser = HfArgumentParser((ModelArguments,))
-    args, = parser.parse_args_into_dataclasses()
-    _main(args)
+@hydra.main(config_path="conf", config_name="config")
+def main(cfg):
+    set_seed(cfg.seed)
+    _main(cfg)
 
 
 if __name__ == "__main__":

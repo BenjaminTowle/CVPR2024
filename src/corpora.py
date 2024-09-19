@@ -18,7 +18,6 @@ if not os.path.exists("data/data_lidc.pickle"):
     gdown.download(f"https://drive.google.com/uc?id={file_id}", "data/data_lidc.pickle", quiet=False)
 
 
-
 def get_bounding_box(ground_truth_map, add_perturbation=False):
     # get bounding box from mask
     y_indices, x_indices = np.where(ground_truth_map > 0)
@@ -121,36 +120,54 @@ class QUBIQ(Dataset):
         return images, labels
         
     def __getitem__(self, indices):
-        bsz = len(indices)
-        image = np.stack([self.images[index] for index in indices], axis=0)
-        label = np.stack([
-            self.labels[index] for index in indices]).astype(float)
-        
-        # Prepare image and prompt for the model
-        if self.processor is not None:
-            image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
-            input_boxes = None
-            if self.use_bounding_box:
-                input_boxes = []
-                for l in label:
-                    while True:
-                        idx = random.randint(0, len(l)-1)
-                        if l[idx].sum() > 0:
-                            break
-                    input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
-            
-            inputs = self.processor(image, input_boxes=input_boxes, do_rescale=True, return_tensors="pt")
+        if type(indices) == int:
+            index = indices
+            image = np.expand_dims(self.images[index], axis=0)
+            label = self.labels[index][random.randint(0, self.num_labels-1)].astype(float)
 
-            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
-            
+            image = np.repeat(image.transpose(1, 2, 0), 3, axis=2)
+            inputs = self.processor(image, do_rescale=False, return_tensors="pt")
+            # remove batch dimension which the processor adds by default
+            inputs = {k:v.squeeze(0) for k,v in inputs.items()}
+            inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device)
+
             inputs["labels"] = F.interpolate(
-                torch.tensor(label), 
+                torch.tensor(label).unsqueeze(0).unsqueeze(0),  
                 size=(256, 256), 
                 mode="nearest"
-            ).bool().squeeze(1)
+            ).bool().squeeze()
 
-            # Create a mask for labels that are blank
-            inputs["label_mask"] = torch.sum(inputs["labels"], dim=(-1, -2)) > 0
+        else:
+            bsz = len(indices)
+            image = np.stack([self.images[index] for index in indices], axis=0)
+            label = np.stack([
+                self.labels[index] for index in indices]).astype(float)
+            
+            # Prepare image and prompt for the model
+            if self.processor is not None:
+                image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
+                input_boxes = None
+                if self.use_bounding_box:
+                    input_boxes = []
+                    for l in label:
+                        while True:
+                            idx = random.randint(0, len(l)-1)
+                            if l[idx].sum() > 0:
+                                break
+                        input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
+                
+                inputs = self.processor(image, input_boxes=input_boxes, do_rescale=True, return_tensors="pt")
+
+                inputs["original_sizes"] = torch.tensor([256, 256]).to(inputs["pixel_values"].device).unsqueeze(0).expand(bsz, -1)
+                
+                inputs["labels"] = F.interpolate(
+                    torch.tensor(label), 
+                    size=(256, 256), 
+                    mode="nearest"
+                ).bool().squeeze(1)
+
+                # Create a mask for labels that are blank
+                inputs["label_mask"] = torch.sum(inputs["labels"], dim=(-1, -2)) > 0
 
         return inputs
 
@@ -272,28 +289,35 @@ class LIDC_IDRI(Dataset):
         return len(self.images)
 
 
-def get_dataset_dict(dataset_name, processor, args):
+def get_dataset_dict(dataset_name, processor, mode: str = "train"):
     if dataset_name == "lidc":
-        dataset = LIDC_IDRI(dataset_location='data/', processor=processor, use_bounding_box=args.use_bounding_box)
+        dataset = LIDC_IDRI(dataset_location='data/', processor=processor)
         dataset_size = len(dataset)
         indices = list(range(dataset_size))
         split = int(np.floor(0.1 * dataset_size))
         train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
-        dataset = {"train": Subset(dataset, train_indices), "valid": Subset(dataset, valid_indices), "test": Subset(dataset, test_indices)}
+
+        if mode == "train":
+            eval_indices = valid_indices
+        else:
+            eval_indices = test_indices
+        
+        dataset = {"train": Subset(dataset, train_indices), "eval": Subset(dataset, eval_indices)}
         
         return dataset
     
     elif dataset_name == "qubiq":
-        train = QUBIQ(processor, split="train", use_bounding_box=args.use_bounding_box)
+        train = QUBIQ(processor, split="train")
         dataset_size = len(train)
         indices = list(range(dataset_size))
         train = Subset(train, indices)
 
-        valid = QUBIQ(processor, split="valid", use_bounding_box=args.use_bounding_box)
+        valid = QUBIQ(processor, split="valid")
         dataset_size = len(valid)
         indices = list(range(dataset_size))
         valid = Subset(valid, indices)
-        return {"train": train, "valid": valid}
+        
+        return {"train": train, "eval": valid}
     
     else:
         raise ValueError(f"Dataset {dataset_name} not found.")
