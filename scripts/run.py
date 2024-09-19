@@ -4,10 +4,8 @@ import os
 sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
 from datasets import disable_caching    
-from dataclasses import dataclass, field
 from torch.utils.data import Subset
 from transformers import (
-    HfArgumentParser, 
     SamProcessor,
     Trainer,
     TrainingArguments,
@@ -34,75 +32,6 @@ SLIP_PATH = "data/lidc_slip"
 MCL_PATH = "data/lidc_mcl"
 AR_PATH = "data/lidc_ar_unet"
 AR_LONG_PATH = "data/lidc_ar_long"
-
-
-@dataclass
-class ModelArguments:
-    model_load_path: str = field(
-        default=SAM,
-        metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
-    )
-
-    results_write_path: str = field(
-        default="data/results_sg.json",
-        metadata={"help": "Path to save results"}
-    )
-
-    processor_load_path: str = field(
-        default=SAM,
-        metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
-    )
-
-    model_save_path: str = field(
-        default="data/dummy",
-        metadata={"help": "Path to the pretrained model or model identifier from huggingface.co/models"}
-    )
-
-    dataset: str = field(
-        default="qubiq",
-        metadata={"help": "Path to the dataset or dataset identifier from huggingface.co/datasets",
-                    "choices": ["lidc", "qubiq"]}
-    )
-
-    model_type: str = field(
-        default="ar",
-        metadata={"help": "Model type", "choices": ["mcl", "det", "seqsam"]}
-    )
-
-    ablation: str = field(
-        default="none",
-        metadata={"help": "Ablation study", "choices": ["none", "random", "sequential", "no_ha", "sg"]}
-    )
-
-    learning_rate: float = field(
-        default=1e-4,
-        metadata={"help": "Learning rate"}
-    )
-
-    num_train_epochs: int = field(
-        default=1,
-        metadata={"help": "Number of training epochs"}
-    )
-
-    use_bounding_box: bool = field(
-        default=True,
-        metadata={"help": "Whether to use bounding boxes"}
-    )
-
-    use_input_masks: bool = field(
-        default=False,
-        metadata={"help": "Whether to use bounding boxes"}
-    )
-
-    num_samples: int = field(
-        default=3,
-        metadata={"help": "Number of simulations for SLIP"}
-    )
-
-    mode: str = field(
-        default="eval",
-        metadata={"help": "Mode", "choices": ["train", "eval"]}
-    )
 
 
 def _main(cfg):
@@ -195,9 +124,9 @@ def _main(cfg):
     processor.save_pretrained(cfg.model.save_path)
 
 
-@hydra.main(config_path="conf", config_name="config")
+@hydra.main(config_path="../conf", config_name="config")
 def main(cfg):
-    set_seed(cfg.seed)
+    set_seed(cfg.params.seed)
     _main(cfg)
 
 

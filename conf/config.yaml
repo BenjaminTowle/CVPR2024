@@ -12,7 +12,7 @@ params:
   batch_size: 2
 
 data:
-  path: ${hydra:runtime.cwd}/data
+  path: ${hydra:runtime.cwd}/../data
   dataset: lidc
 
 mode: eval
