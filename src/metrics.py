@@ -1,14 +1,16 @@
 import json
 import numpy as np
-from medpy.metric import jc, dc
 
-def calc_dsc(image_0, image_1):
+from medpy.metric import jc, dc
+from typing import Optional, Iterable
+
+def calc_dsc(image_0: np.array, image_1):
     if np.sum(image_0) == 0 and np.sum(image_1) == 0:
         return np.nan
     else:
         return dc(image_1, image_0)
 
-def compute_dice(predictions, labels):
+def compute_dice(predictions: np.array, labels: np.array):
     results = []
     for pred, label in zip(predictions, labels):
         pred = np.round(np.mean((pred > 0.0).astype(np.float32), axis=0)).astype(np.int64)
@@ -25,7 +27,7 @@ def compute_dice(predictions, labels):
 
     return results
 
-def compute_dice_max(predictions, labels):
+def compute_dice_max(predictions: np.array, labels: np.array):
     results = []
     for pred, label in zip(predictions, labels):
         pred = pred > 0.0
@@ -37,14 +39,9 @@ def compute_dice_max(predictions, labels):
         dmax = np.mean(max_dice_scores)
         results.append(dmax)
 
-        # 1.0 when undefined see below:
-        # https://openaccess.thecvf.com/content/CVPR2023/papers/Rahman_Ambiguous_Medical_Image_Segmentation_Using_Diffusion_Models_CVPR_2023_paper.pdf
-        #scores = [s if not np.isnan(s) else 1.0 for s in scores] 
-        #results.append(np.max(scores))
-
     return results
 
-def compute_dice_nod(predictions, labels):
+def compute_dice_nod(predictions: np.array, labels: np.array):
     results = []
     for pred, label in zip(predictions, labels):
         pred = np.round(np.mean((pred > 0.0).astype(np.float32), axis=0)).astype(np.int64)
@@ -53,13 +50,11 @@ def compute_dice_nod(predictions, labels):
         if np.sum(label) == 0:
             continue
 
-        #results.append(
-         #   np.mean([np.mean([calc_dsc(target == i, pred == i) for i in range(2)]) for target in label if np.sum(target) > 0]))
         results.append(np.mean([calc_dsc(target, pred) for target in label if np.sum(target) > 0]))
 
     return results
 
-def compute_ged(predictions, labels):
+def compute_ged(predictions: np.array, labels: np.array):
     _geds = []
     diversities = []
     for pred, label in zip(predictions, labels):
@@ -70,7 +65,7 @@ def compute_ged(predictions, labels):
 
     return _geds, diversities
 
-def compute_blanks(predictions, labels):
+def compute_blanks(predictions: np.array, labels: np.array):
     pred_blanks = []
     label_blanks = []
     for pred, label in zip(predictions, labels):
@@ -81,7 +76,6 @@ def compute_blanks(predictions, labels):
     return pred_blanks, label_blanks
 
 def iou(A: np.array, B: np.array) -> float:
-    """Calculate the intersection over union of two binary masks."""
     intersection = np.logical_and(A, B)
     union = np.logical_or(A, B)
     if np.sum(union) == 0:
@@ -90,12 +84,11 @@ def iou(A: np.array, B: np.array) -> float:
 
 
 def dice(A: np.array, B: np.array) -> float:
-    #Calculate the dice score of two binary masks.
     intersection = np.logical_and(A, B)
     return 2 * np.sum(intersection) / (np.sum(A) + np.sum(B))
 
 
-def dist_fct(m1, m2, nlabels, label_range):
+def dist_fct(m1: np.array, m2: np.array, nlabels: int, label_range: Iterable):
     per_label_iou = []
     for lbl in label_range:
 
@@ -113,13 +106,11 @@ def dist_fct(m1, m2, nlabels, label_range):
     return 1 - (sum(per_label_iou) / nlabels)
 
 
-def generalised_energy_distance(sample_arr, gt_arr, nlabels, label_range):
+def generalised_energy_distance(sample_arr: np.array, gt_arr: np.array, nlabels: int, label_range: Iterable):
     """
     :param sample_arr: expected shape N x X x Y 
-    :param gt_arr: M x X x Y
-    :return: 
+    :param gt_arr: M x X x Y 
     """
-
     N = sample_arr.shape[0]
     M = gt_arr.shape[0]
 
@@ -135,83 +126,22 @@ def generalised_energy_distance(sample_arr, gt_arr, nlabels, label_range):
 
     for i in range(M):
         for j in range(M):
-            # print(dist_fct(gt_arr[i,...], gt_arr[j,...]))
             d_yy.append(dist_fct(gt_arr[i, ...], gt_arr[j, ...], nlabels, label_range))
     diversity = (1. / N ** 2) * sum(d_ss)
     return (2. / (N * M)) * sum(d_sy) - diversity - (1. / M ** 2) * sum(d_yy), diversity
 
 
-def collective_insight(predictions, labels):
-    cis = []
-    for pred, label in zip(predictions, labels):
-        pred = pred > 0.0
-        
-        # Combined sensitivity
-        pred_union = np.sum(pred, axis=0) > 0
-        label_union = np.sum(label, axis=0) > 0
-        tp = np.sum(np.logical_and(pred_union, label_union))
-        fn = np.sum(np.logical_and(label_union, np.logical_not(pred_union)))
-        sc = tp / (tp + fn)
-
-        # Maximum dice matching
-        dice_scores = np.zeros((len(pred), len(label)))
-        for i, p in enumerate(pred):
-            for j, l in enumerate(label):
-                dice_scores[i, j] = dice(p, l)
-        max_dice_scores = np.max(dice_scores, axis=1)
-        dmax = np.mean(max_dice_scores)
-
-        # Diversity agreement
-        dice_scores = []
-        for i, p in enumerate(pred):
-            for j, l in enumerate(pred):
-                if i == j:
-                    continue
-                dice_scores.append(1 - dice(p, l))
-        # The original paper calls this variance, but it is actually the diversity
-        var_pred_min = min(dice_scores)
-        var_pred_max = max(dice_scores)
-
-        dice_scores = []
-        for i, p in enumerate(label):
-            for j, l in enumerate(label):
-                if i == j:
-                    continue
-                dice_scores.append(1 - dice(p, l))
-        # The original paper calls this variance, but it is actually the diversity
-        if dice_scores == []:
-            dice_scores = [0.0]
-        var_label_min = min(dice_scores)
-        var_label_max = max(dice_scores)
-
-        var_min = abs(var_pred_min - var_label_min)
-        var_max = abs(var_pred_max - var_label_max)
-
-        da = 1 - ((var_min + var_max) / 2)
-
-        ci = (3 * sc * dmax * da) / (sc + dmax + da)
-        cis.append(ci)
-
-    return cis
-
-def compute_metrics(eval_pred, write_path: str = "data/results.json"): 
+def compute_metrics(eval_pred, write_path: Optional[str] = None): 
     predictions = eval_pred.predictions[1]
     labels = eval_pred.label_ids[0].astype(bool)
-    non_empty_predictions = []
     non_empty_labels = []
-    for prediction, label in zip(predictions, labels):
-        non_empty_label = []
-        for lab in label:
-            if np.sum(lab) > 0:
-                non_empty_label.append(lab)
-        
+    for label in labels:
+        non_empty_label = [lab for lab in label if np.sum(lab) > 0]
         non_empty_labels.append(np.array(non_empty_label))
     non_empty_labels = np.array(non_empty_labels)
+    labels = non_empty_labels  # semi-supervised task assumes there is object to annotate
 
-    #predictions = non_empty_predictions
-    labels = non_empty_labels
-
-    predictions = predictions.squeeze(1)
+    predictions = predictions.squeeze(1)  # Binary classification, so remove class dim
     ged, diversity = compute_ged(predictions, labels)
     _, label_diversity = compute_ged(labels, labels)
     pred_blanks, label_blanks = compute_blanks(predictions, labels)
@@ -220,7 +150,6 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
         "dice": compute_dice(predictions, labels),
         "dice_max": compute_dice_max(predictions, labels),
         "dice_nod": compute_dice_nod(predictions, labels),
-        "collective_insight": collective_insight(predictions, labels) if predictions.shape[1] != 1 else 0.0,
         "ged": ged,
         "sample_diversity": diversity,
         "label_diversity": label_diversity,

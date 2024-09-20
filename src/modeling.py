@@ -113,7 +113,7 @@ class SamBaseline(SamPreTrainedModel):
             multimask_output=self.multimask_output,
         )
 
-        loss = self.compute_loss(
+        loss = compute_loss(
             pred_masks=outputs.pred_masks, 
             labels=labels, 
             loss_fn=self.seg_loss, 

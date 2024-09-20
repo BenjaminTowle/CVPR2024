@@ -1,20 +1,23 @@
 model:
   load_path: facebook/sam-vit-base
-  save_path: dummy
-  type: mcl  # Options: seqsam, det, mcl
+  save_path: seqsam-qubiq
+  type: seqsam  # Options: seqsam, det, mcl
   ablation: none  # Options: none, random, sequential, no_ha, sg
   num_samples: 3
 
 params:
   learning_rate: 1e-4
-  num_train_epochs: 1
+  num_train_epochs: 10
   seed: 42
   batch_size: 2
+  weight_decay: 0.01
+  logging_steps: 10
+
 
 data:
-  path: ${hydra:runtime.cwd}/../data
-  dataset: lidc
+  path: ${hydra:runtime.cwd}/data
+  dataset: qubic  # Options: lidc, qubic 
 
-mode: eval
-debug: true
+mode: train
+debug: false
 

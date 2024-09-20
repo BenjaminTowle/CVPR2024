@@ -1,29 +1,29 @@
 import hydra
-import sys
+import numpy as np
+import random
 import os
+import sys
+import torch
 sys.path.append(os.path.dirname(sys.path[0]))  # add root folder to sys.path
 
-from datasets import disable_caching    
+from datasets import disable_caching  
+from functools import partial  
 from torch.utils.data import Subset
 from transformers import (
     SamProcessor,
     Trainer,
     TrainingArguments,
 )
-from functools import partial
 from transformers.utils import logging
-import os
 
 from src.corpora import get_dataset_dict
 from src.metrics import compute_metrics
 from src.modeling import SamBaseline, SeqSam
-from src.utils import set_seed
 
 
 logger = logging.get_logger()
 logging.set_verbosity_info()
 disable_caching()
-os.environ["WANDB_DISABLED"] = "true"
 
 MEDSAM = "wanglab/medsam-vit-base"
 SAM = "facebook/sam-vit-base"
@@ -32,6 +32,20 @@ SLIP_PATH = "data/lidc_slip"
 MCL_PATH = "data/lidc_mcl"
 AR_PATH = "data/lidc_ar_unet"
 AR_LONG_PATH = "data/lidc_ar_long"
+
+
+SEED = 42
+
+
+def set_seed(seed: int = None):
+    # Set random seed
+    if seed is None:
+        seed = SEED
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def _main(cfg):
@@ -61,9 +75,9 @@ def _main(cfg):
     else:
         raise ValueError(f"Model type {cfg.model.type} not supported")
 
-    dataset = get_dataset_dict(cfg.data.dataset, processor, cfg.mode)
+    dataset = get_dataset_dict(processor, cfg)
     
-    # Downsample the training set to 1000 samples for debugging
+    # Downsample the training set to 100 samples for debugging
     def _filter(dataset):
         num_samples = min(len(dataset), 100)
         return Subset(dataset, list(range(num_samples)))
@@ -87,15 +101,16 @@ def _main(cfg):
         per_device_train_batch_size=cfg.params.batch_size,
         per_device_eval_batch_size=cfg.params.batch_size,
         dataloader_drop_last=False,
-        weight_decay=0.01,
+        weight_decay=cfg.params.weight_decay,
         logging_dir="./logs",
-        logging_steps=10,
-        #evaluation_strategy="epoch",
-        evaluation_strategy="steps",
-        eval_steps=200,
+        logging_steps=cfg.params.logging_steps,
+        evaluation_strategy="epoch",
+        #evaluation_strategy="steps",
+        #eval_steps=200,
         save_strategy="epoch",
         save_total_limit=1,
         learning_rate=cfg.params.learning_rate,
+        report_to="none"
     )
 
     r_path = "_".join(
@@ -109,19 +124,18 @@ def _main(cfg):
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["eval"],
-        compute_metrics=_compute_metrics,
+        compute_metrics=_compute_metrics
     )
 
-    if cfg.mode == "eval":
-        results = trainer.evaluate()
-        logger.info(results)
-        exit()
+    if cfg.mode == "train":
+        trainer.evaluate()
+        trainer.train()
 
-    trainer.evaluate()
-    trainer.train()
+        model.save_pretrained(cfg.model.save_path)
+        processor.save_pretrained(cfg.model.save_path)
 
-    model.save_pretrained(cfg.model.save_path)
-    processor.save_pretrained(cfg.model.save_path)
+    results = trainer.evaluate()
+    logger.info(results)
 
 
 @hydra.main(config_path="../conf", config_name="config")

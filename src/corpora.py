@@ -7,8 +7,8 @@ import random
 import torch
 import torch.nn.functional as F
 
+from abc import ABC
 from typing import Union, List
-from abc import ABC, abstractmethod
 from datasets import Dataset
 from os.path import join
 from PIL import Image
@@ -40,13 +40,13 @@ class MultiLabelDataset(Dataset, ABC):
     images = []
     labels = []
 
-    def __init__(self, processor, data_dir: str, split = "train") -> None:
+    def __init__(self, processor, data_dir: str) -> None:
+        
         s_path = os.path.join(data_dir, self.file_name)
         if not os.path.exists(s_path):
             gdown.download(f"https://drive.google.com/uc?id={self.file_id}", s_path, quiet=False)
 
         self.processor = processor
-        self.split = split
         self.data_dir = data_dir
 
     def __getitem__(self, indices: Union[int, List[int]]):
@@ -74,11 +74,11 @@ class MultiLabelDataset(Dataset, ABC):
                 self.labels[index] for index in indices]).astype(float)
             
             # Prepare image and prompt for the model
-            image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)
+            image = np.repeat(np.expand_dims(image, axis=-1), 3, axis=-1)  # 3 channels
             input_boxes = []
             for l in label:
                 while True:
-                    idx = random.randint(0, 3)
+                    idx = random.randint(0, self.num_labels - 1)
                     if l[idx].sum() > 0:
                         break
                 input_boxes.append([get_bounding_box(l[idx], add_perturbation=False)])  
@@ -100,6 +100,10 @@ class MultiLabelDataset(Dataset, ABC):
 
     def __len__(self):
         return len(self.images)
+
+    @property
+    def num_labels(self):
+        return len(self.labels[0])
         
 
 class QUBIQ(MultiLabelDataset):
@@ -109,15 +113,15 @@ class QUBIQ(MultiLabelDataset):
     file_name = "qubiq.zip"
 
     def __init__(self, processor, data_dir: str, split="train") -> None:
-        super().__init__(processor, data_dir, split)
+        super().__init__(processor, data_dir)
 
         z_path = os.path.join(self.data_dir, self.file_name)
-        f_path = os.path.splitext(os.path.basename(z_path))[0]
+        f_path = os.path.splitext(z_path)[0]
         if not os.path.exists(f_path): 
             from zipfile import ZipFile 
         
             with ZipFile(z_path) as zObject:  
-                zObject.extractall(path=f_path) 
+                zObject.extractall(path=self.data_dir) 
 
         self.i = 0
         self.images, self.labels = self.preprocess(split)
@@ -202,11 +206,7 @@ class LIDC_IDRI(MultiLabelDataset):
 
     series_uid = []
 
-    def __init__(
-        self, 
-        data_dir, 
-        processor=None  
-    ):
+    def __init__(self, data_dir, processor=None):
         
         super().__init__(processor, data_dir)
         self.processor = processor
@@ -242,43 +242,42 @@ class LIDC_IDRI(MultiLabelDataset):
         del new_data
         del data
 
-        self.num_labels = 4
+def load_lidc(processor, cfg):
+    dataset = LIDC_IDRI(processor=processor, data_dir=cfg.data.path)
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+    TRAIN_SIZE = 0.9
+    split = int(np.floor((1.0 - TRAIN_SIZE) * dataset_size))
+    train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
+
+    eval_indices = valid_indices if cfg.mode == "train" else test_indices
+
+    dataset = {"train": Subset(dataset, train_indices), "eval": Subset(dataset, eval_indices)}
+    
+    return dataset
+
+def load_qubic(processor, cfg):
+
+    def map_fn(split: str):
+        dataset = QUBIQ(processor=processor, data_dir=cfg.data.path, split=split)
+        dataset_size = len(dataset)
+        indices = list(range(dataset_size))
+        dataset = Subset(dataset, indices)
+
+        return dataset
+
+    splits = ["train", "eval"]
+
+    return {split: map_fn(split) for split in splits}
 
     
-def get_dataset_dict(dataset_name, processor, cfg):
+def get_dataset_dict(processor, cfg):
     if not os.path.exists(cfg.data.path):
         os.makedirs(cfg.data.path)
     
-    if dataset_name == "lidc":
-
-        dataset = LIDC_IDRI(data_dir=cfg.data.path, processor=processor)
-        dataset_size = len(dataset)
-        indices = list(range(dataset_size))
-        split = int(np.floor(0.1 * dataset_size))
-        train_indices, valid_indices, test_indices = indices[2*split:], indices[:split], indices[split:split*2]
-
-        if cfg.mode == "train":
-            eval_indices = valid_indices
-        else:
-            eval_indices = test_indices
-        
-        dataset = {"train": Subset(dataset, train_indices), "eval": Subset(dataset, eval_indices)}
-        
-        return dataset
+    dataset2loader = {
+        "lidc": load_lidc,
+        "qubic": load_qubic
+    }
     
-    elif dataset_name == "qubiq":
-
-        train = QUBIQ(processor, split="train")
-        dataset_size = len(train)
-        indices = list(range(dataset_size))
-        train = Subset(train, indices)
-
-        valid = QUBIQ(processor, split="valid")
-        dataset_size = len(valid)
-        indices = list(range(dataset_size))
-        valid = Subset(valid, indices)
-        
-        return {"train": train, "eval": valid}
-    
-    else:
-        raise ValueError(f"Dataset {dataset_name} not found.")
+    return dataset2loader[cfg.data.dataset](processor, cfg)
