@@ -1,7 +1,7 @@
 model:
-  load_path: facebook/sam-vit-base
-  save_path: seqsam-qubiq
-  type: seqsam  # Options: seqsam, det, mcl
+  load_path: wanglab/medsam-vit-base
+  save_path: seqsam-qubiq-10
+  type: mcl  # Options: seqsam, det, mcl
   ablation: none  # Options: none, random, sequential, no_ha, sg
   num_samples: 3
 
@@ -16,8 +16,7 @@ params:
 
 data:
   path: ${hydra:runtime.cwd}/data
-  dataset: qubic  # Options: lidc, qubic 
+  dataset: lidc  # Options: lidc, qubic 
 
 mode: train
 debug: false
-

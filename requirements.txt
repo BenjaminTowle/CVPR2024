@@ -1,4 +1,5 @@
 datasets
+hydra-core
 medpy
 monai
 numpy==1.23.4

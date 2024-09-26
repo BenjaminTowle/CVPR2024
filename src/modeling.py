@@ -129,6 +129,43 @@ class SamBaseline(SamPreTrainedModel):
         )
 
 
+class CRnnCell(nn.Module):
+    def __init__(self):
+        # A cnn which goes from 512 x 64 x 64 -> 256 x 64 x 64
+        super(CRnnCell, self).__init__()
+        self.hidden_state = None
+        self.conv_o = nn.Conv2d(512, 256, kernel_size=3, padding=1)
+        self.conv_h = nn.Conv2d(512, 256, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        if self.hidden_state is None:
+            self.hidden_state = torch.zeros(x.size(0), 256, x.size(2), x.size(3), device=x.device)
+        combined = torch.cat([x, self.hidden_state], dim=1)
+        o = self.conv_o(combined)
+        h = self.conv_h(combined)
+        self.hidden_state = h
+        
+        return o
+    
+    def reset(self):
+        self.hidden_state = None
+
+
+def wrap_forward(
+    old_forward: callable,
+    cell: CRnnCell,
+    dense_prompt_embeddings: torch.Tensor,
+    **kwargs
+):
+
+    dense_prompt_embeddings = cell(dense_prompt_embeddings)
+
+    return old_forward(
+        dense_prompt_embeddings=dense_prompt_embeddings,
+        **kwargs
+    )
+
+
 class SeqSam(SamPreTrainedModel):
 
     def __init__(self, config, num_samples: int = 4, ablation: str = "none"):
@@ -233,40 +270,3 @@ class SeqSam(SamPreTrainedModel):
             iou_scores=outputs.iou_scores,
             pred_masks=pred_masks[:, :, :self.num_samples],
         )
-
-
-class CRnnCell(nn.Module):
-    def __init__(self):
-        # A cnn which goes from 512 x 64 x 64 -> 256 x 64 x 64
-        super(CRnnCell, self).__init__()
-        self.hidden_state = None
-        self.conv_o = nn.Conv2d(512, 256, kernel_size=3, padding=1)
-        self.conv_h = nn.Conv2d(512, 256, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        if self.hidden_state is None:
-            self.hidden_state = torch.zeros(x.size(0), 256, x.size(2), x.size(3), device=x.device)
-        combined = torch.cat([x, self.hidden_state], dim=1)
-        o = self.conv_o(combined)
-        h = self.conv_h(combined)
-        self.hidden_state = h
-        
-        return o
-    
-    def reset(self):
-        self.hidden_state = None
-
-
-def wrap_forward(
-    old_forward: callable,
-    cell: CRnnCell,
-    dense_prompt_embeddings: torch.Tensor,
-    **kwargs
-):
-
-    dense_prompt_embeddings = cell(dense_prompt_embeddings)
-
-    return old_forward(
-        dense_prompt_embeddings=dense_prompt_embeddings,
-        **kwargs
-    )

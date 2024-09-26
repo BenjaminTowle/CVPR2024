@@ -1,0 +1,8 @@
+defaults:
+  - medsam
+
+model:
+  save_path: medsam-qubic
+  
+data:
+  dataset: qubic

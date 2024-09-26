@@ -1,0 +1,6 @@
+defaults:
+  - config
+
+model:
+  load_path: wanglab/medsam-vit-base
+  num_samples: 3

@@ -217,7 +217,7 @@ class LIDC_IDRI(MultiLabelDataset):
             filename = os.fsdecode(file)
             if '.pickle' in filename:
                 print("Loading file", filename)
-                file_path = data_dir + filename
+                file_path = os.path.join(data_dir, filename)
                 bytes_in = bytearray(0)
                 input_size = os.path.getsize(file_path)
                 with open(file_path, 'rb') as f_in:

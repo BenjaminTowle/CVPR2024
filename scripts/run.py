@@ -131,11 +131,13 @@ def _main(cfg):
         trainer.evaluate()
         trainer.train()
 
-        model.save_pretrained(cfg.model.save_path)
-        processor.save_pretrained(cfg.model.save_path)
+        save_path = os.path.join(cfg.data.path, cfg.model.save_path)
+        model.save_pretrained(save_path)
+        processor.save_pretrained(save_path)
 
     results = trainer.evaluate()
-    logger.info(results)
+    for key, value in results.items():
+        logger.info(f"{key}: {round(value, 3)}")
 
 
 @hydra.main(config_path="../conf", config_name="config")
